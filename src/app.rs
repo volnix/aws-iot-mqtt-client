@@ -2328,7 +2328,7 @@ fn message_bubble(ui: &mut egui::Ui, message: &ReceivedMessage) {
             ui.label(theme::title(&message.topic).monospace());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(message.timestamp.format("%H:%M:%S%.3f").to_string())
+                    RichText::new(message.timestamp.strftime("%H:%M:%S%.3f").to_string())
                         .small()
                         .color(p.muted),
                 );
@@ -2345,7 +2345,7 @@ fn message_bubble(ui: &mut egui::Ui, message: &ReceivedMessage) {
 
 /// The `GetConnection` fields worth seeing at a glance.
 fn connection_essentials(info: &ConnectionInfo) -> Vec<(&'static str, String)> {
-    let fmt_time = |t: &chrono::DateTime<chrono::Local>| t.format("%H:%M:%S").to_string();
+    let fmt_time = |t: &jiff::ZonedDateTime| t.strftime("%H:%M:%S").to_string();
     let yes_no = |b: bool| if b { "Yes" } else { "No" }.to_owned();
     let mut rows = vec![("Connected", yes_no(info.connected))];
     if let Some(t) = &info.connected_since {
@@ -2363,7 +2363,7 @@ fn connection_essentials(info: &ConnectionInfo) -> Vec<(&'static str, String)> {
 
 /// Everything else `GetConnection` returned.
 fn connection_more(info: &ConnectionInfo) -> Vec<(&'static str, String)> {
-    let fmt_time = |t: &chrono::DateTime<chrono::Local>| t.format("%Y-%m-%d %H:%M:%S").to_string();
+    let fmt_time = |t: &jiff::ZonedDateTime| t.strftime("%Y-%m-%d %H:%M:%S").to_string();
     let mut rows = Vec::new();
     if let Some(v) = &info.client_id {
         rows.push(("Client ID", v.clone()));
@@ -2437,7 +2437,7 @@ fn log_rows(ui: &mut egui::Ui, id: &str, rows: &[&PacketLogEntry], kind_width: u
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 12.0;
                             ui.label(
-                                RichText::new(entry.timestamp.format("%H:%M:%S%.3f").to_string())
+                                RichText::new(entry.timestamp.strftime("%H:%M:%S%.3f").to_string())
                                     .monospace()
                                     .color(p.muted),
                             );

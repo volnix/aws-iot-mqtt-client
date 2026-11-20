@@ -18,3 +18,6 @@
 
 # Release archives built by scripts/package.py
 /dist/
+
+# Python bytecode from the helper scripts
+__pycache__/

@@ -27,6 +27,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Design tokens in `assets/theme.json`, reloaded live in debug builds, with automated contrast
   checks against the glass surfaces.
 - `scripts/dev.py`: rebuild and relaunch on every source change.
+- Security: the AWS SDK now uses its current rustls 0.23 HTTPS client instead of the legacy
+  rustls 0.21 stack, which removes several RustSec advisories. `chrono` (unmaintained) was
+  replaced with `jiff`, and the app now uses rustls' own PEM parser.
+- CI measures test coverage (`cargo-llvm-cov`, uploaded to Codecov).
 - Release automation: pushing a `v*` tag publishes macOS (universal `.app`), Linux (x86_64,
   arm64), and Windows (x86_64) builds with SHA-256 checksums. `scripts/package.py` builds the
   same archive locally.

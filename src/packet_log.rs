@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use chrono::{DateTime, Local};
+use jiff::ZonedDateTime;
 
 pub const DEFAULT_CAPACITY: usize = 1000;
 
@@ -26,7 +26,7 @@ impl Direction {
 
 #[derive(Debug, Clone)]
 pub struct PacketLogEntry {
-    pub timestamp: DateTime<Local>,
+    pub timestamp: ZonedDateTime,
     pub direction: Direction,
     /// Packet type, e.g. `CONNECT`, `PUBLISH`.
     pub kind: String,
@@ -36,7 +36,7 @@ pub struct PacketLogEntry {
 impl PacketLogEntry {
     pub fn new(direction: Direction, kind: impl Into<String>, details: impl Into<String>) -> Self {
         Self {
-            timestamp: Local::now(),
+            timestamp: ZonedDateTime::now(),
             direction,
             kind: kind.into(),
             details: details.into(),
@@ -129,6 +129,17 @@ mod tests {
         assert_eq!(kinds, ["B", "C"]);
         log.clear();
         assert!(log.is_empty());
+    }
+
+    /// The log and message views format timestamps as `HH:MM:SS.mmm`.
+    #[test]
+    fn timestamps_format_with_milliseconds() {
+        let ts = jiff::Timestamp::from_millisecond(1_700_000_000_123).unwrap();
+        let zoned = ts.to_zoned_datetime(jiff::tz::TimeZone::UTC);
+        assert_eq!(zoned.strftime("%H:%M:%S%.3f").to_string(), "22:13:20.123");
+        let entry = PacketLogEntry::new(Direction::Sent, "PING", "");
+        let shown = entry.timestamp.strftime("%H:%M:%S%.3f").to_string();
+        assert_eq!(shown.len(), 12, "{shown}");
     }
 
     #[test]

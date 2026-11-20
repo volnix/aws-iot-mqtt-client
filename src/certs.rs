@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use rustls::pki_types::pem::{self, PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
@@ -74,7 +76,7 @@ pub fn parse_certificate(pem: &[u8]) -> Result<LocalCertificate, AppError> {
             .with_action("Provide a PEM-encoded certificate (-----BEGIN CERTIFICATE-----).")
     };
 
-    let ders = rustls_pemfile::certs(&mut &pem[..])
+    let ders = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| invalid(format!("PEM parse error: {e}")))?;
     let leaf = ders
@@ -104,38 +106,25 @@ pub fn parse_private_key(pem: &[u8]) -> Result<LocalPrivateKey, AppError> {
             .with_action("Provide an unencrypted PEM private key (RSA, EC, or PKCS#8).")
     };
 
-    let mut reader = pem;
-    loop {
-        match rustls_pemfile::read_one(&mut reader) {
-            Ok(Some(rustls_pemfile::Item::Pkcs1Key(_))) => {
-                return Ok(LocalPrivateKey {
-                    pem: pem.to_vec(),
-                    kind: KeyKind::Rsa,
-                })
-            }
-            Ok(Some(rustls_pemfile::Item::Sec1Key(_))) => {
-                return Ok(LocalPrivateKey {
-                    pem: pem.to_vec(),
-                    kind: KeyKind::Ec,
-                })
-            }
-            Ok(Some(rustls_pemfile::Item::Pkcs8Key(_))) => {
-                return Ok(LocalPrivateKey {
-                    pem: pem.to_vec(),
-                    kind: KeyKind::Pkcs8,
-                })
-            }
-            Ok(Some(_)) => continue,
-            Ok(None) => {
-                let hint = if String::from_utf8_lossy(pem).contains("ENCRYPTED PRIVATE KEY") {
-                    "Encrypted private keys are not supported; decrypt it first (openssl pkcs8 -in key.pem -out key-plain.pem)."
-                } else {
-                    "No PRIVATE KEY block found"
-                };
-                return Err(invalid(hint.into()));
-            }
-            Err(e) => return Err(invalid(format!("PEM parse error: {e}"))),
+    // The first private key in the file, skipping any certificates or other sections.
+    match PrivateKeyDer::from_pem_slice(pem) {
+        Ok(key) => Ok(LocalPrivateKey {
+            pem: pem.to_vec(),
+            kind: match key {
+                PrivateKeyDer::Pkcs1(_) => KeyKind::Rsa,
+                PrivateKeyDer::Sec1(_) => KeyKind::Ec,
+                _ => KeyKind::Pkcs8,
+            },
+        }),
+        Err(pem::Error::NoItemsFound) => {
+            let hint = if String::from_utf8_lossy(pem).contains("ENCRYPTED PRIVATE KEY") {
+                "Encrypted private keys are not supported; decrypt it first (openssl pkcs8 -in key.pem -out key-plain.pem)."
+            } else {
+                "No PRIVATE KEY block found"
+            };
+            Err(invalid(hint.into()))
         }
+        Err(e) => Err(invalid(format!("PEM parse error: {e}"))),
     }
 }
 

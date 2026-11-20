@@ -235,7 +235,9 @@ pub async fn open_session(
             let kind = match creds.expiry() {
                 Some(t) => format!(
                     "temporary credentials, expire {}",
-                    chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S")
+                    jiff::ZonedDateTime::try_from(t)
+                        .map(|z| z.strftime("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|_| "at an unknown time".into())
                 ),
                 None => "long-term credentials".to_owned(),
             };
@@ -649,9 +651,9 @@ impl Session {
         // Absent numeric fields come back as 0.
         let millis = |ms: i64| {
             (ms > 0)
-                .then(|| chrono::DateTime::from_timestamp_millis(ms))
+                .then(|| jiff::Timestamp::from_millisecond(ms).ok())
                 .flatten()
-                .map(|d| d.with_timezone(&chrono::Local))
+                .map(|ts| ts.to_zoned_datetime(jiff::tz::TimeZone::system()))
         };
         Ok(ConnectionInfo {
             client_id: out.client_id().map(str::to_owned),
@@ -730,8 +732,8 @@ pub struct ConnectionInfo {
     pub clean_session: bool,
     pub keep_alive_secs: i32,
     pub session_expiry_secs: i64,
-    pub connected_since: Option<chrono::DateTime<chrono::Local>>,
-    pub disconnected_since: Option<chrono::DateTime<chrono::Local>>,
+    pub connected_since: Option<jiff::ZonedDateTime>,
+    pub disconnected_since: Option<jiff::ZonedDateTime>,
     pub disconnect_reason: Option<String>,
     /// `ip:port` of the client, when socket information was requested and authorized.
     pub source: Option<String>,

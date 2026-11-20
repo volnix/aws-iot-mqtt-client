@@ -64,6 +64,35 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
 
+  coverage:
+    name: Test coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: coverage-${{ hashFiles('Cargo.lock') }}
+      - name: Measure coverage
+        run: cargo llvm-cov --locked --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # Until the CODECOV_TOKEN secret is set, the upload is skipped without failing CI.
+          fail_ci_if_error: false
+
   msrv:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
