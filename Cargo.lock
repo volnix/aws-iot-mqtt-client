@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "aws-iot-mqtt-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aws-config",
  "aws-sdk-iot",

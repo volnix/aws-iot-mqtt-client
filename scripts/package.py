@@ -53,6 +53,15 @@ def crate_version() -> str:
     return match.group(1)
 
 
+def normalize(version: str) -> str:
+    """Pads a short version to three parts, so a `v1.0` tag matches version 1.0.0."""
+    core, sep, rest = version.partition("-")
+    parts = core.split(".")
+    while len(parts) < 3:
+        parts.append("0")
+    return ".".join(parts) + sep + rest
+
+
 def host_target() -> str:
     out = subprocess.run(["rustc", "-vV"], capture_output=True, text=True, check=True).stdout
     for line in out.splitlines():
@@ -179,7 +188,7 @@ def main() -> int:
     args = parser.parse_args()
 
     version = crate_version()
-    if args.expect_version and args.expect_version != version:
+    if args.expect_version and normalize(args.expect_version) != normalize(version):
         sys.exit(
             f"Tag version {args.expect_version!r} doesn't match Cargo.toml version {version!r}. "
             "Update Cargo.toml (and CHANGELOG.md), commit, and tag again."

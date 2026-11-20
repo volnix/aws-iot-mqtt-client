@@ -155,8 +155,9 @@ Releases are built and published by
 
 Notes:
 
-- **Version check:** the tag must match `Cargo.toml`. Tagging `v0.2.0` while `Cargo.toml` says
-  `0.1.0` fails the build before anything is published.
+- **Version check:** the tag must match `Cargo.toml`. Tagging `v1.1.0` while `Cargo.toml` says
+  `1.0.0` fails the build before anything is published. Short tags count as `.0`, so `v1.0`
+  matches `1.0.0`.
 - **Pre-releases:** a tag with a hyphen, such as `v0.2.0-beta.1`, is published as a
   pre-release.
 - **Dry run:** to check the builds without publishing, open **Actions → Release → Run

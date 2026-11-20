@@ -1,6 +1,6 @@
 [package]
 name = "aws-iot-mqtt-client"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Cross-platform desktop MQTT 3.1.1/5 client for AWS IoT Core"
