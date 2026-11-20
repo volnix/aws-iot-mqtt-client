@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Never commit device credentials
+*.pem.key
+*-private.pem.key
+*.key
+!assets/*.pem
+
+# Local tool settings
+.claude/
+
+# Release archives built by scripts/package.py
+/dist/

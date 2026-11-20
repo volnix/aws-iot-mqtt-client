@@ -1,0 +1,117 @@
+name: Release
+
+# Publishes downloadable builds for macOS, Linux, and Windows to GitHub Releases.
+#
+# To release: set the version in Cargo.toml, update CHANGELOG.md, commit, then push a matching
+# tag, e.g. `git tag v0.1.0 && git push origin v0.1.0`. A tag with a hyphen (v0.2.0-beta.1)
+# is published as a pre-release.
+#
+# To try the builds without publishing, run this workflow manually from the Actions tab; the
+# archives are attached to the run as artifacts.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS universal
+            os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --macos-universal
+          # Ubuntu 22.04 links against an older glibc, so the binaries also run on older distros.
+          - name: Linux x86_64
+            os: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+            args: --target x86_64-unknown-linux-gnu
+          - name: Linux arm64
+            os: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
+            args: --target aarch64-unknown-linux-gnu
+          - name: Windows x86_64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+          libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.targets }}
+          rustup default stable
+
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: echo "EXPECT=--expect-version ${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build and package
+        shell: bash
+        run: python scripts/package.py ${{ matrix.args }} $EXPECT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        working-directory: dist
+        run: |
+          cat *.sha256 > SHA256SUMS
+          rm *.sha256
+          sha256sum -c SHA256SUMS
+          ls -l
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            $prerelease

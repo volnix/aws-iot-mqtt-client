@@ -1,0 +1,63 @@
+{
+  "metrics": {
+    "card_radius": 16,
+    "control_radius": 10,
+    "card_padding": 14,
+    "gap": 12,
+    "shadow_blur": 28,
+    "shadow_offset_y": 10,
+    "font_heading": 16.5,
+    "font_body": 13.5,
+    "font_button": 13.0,
+    "font_small": 11.5,
+    "font_mono": 12.5
+  },
+  "light": {
+    "background_top": "#EAF0F6",
+    "background_bottom": "#E3E8F1",
+    "orbs": [
+      { "x": 0.08, "y": 0.05, "radius": 0.55, "color": "#5EEAD466" },
+      { "x": 0.95, "y": 0.18, "radius": 0.50, "color": "#93C5FD66" },
+      { "x": 0.55, "y": 1.05, "radius": 0.65, "color": "#C4B5FD59" }
+    ],
+    "glass": "#FFFFFFB3",
+    "glass_strong": "#FFFFFFE6",
+    "glass_border": "#FFFFFFD9",
+    "shadow": "#1E293B1A",
+    "inset": "#0F172A0D",
+    "border_strong": "#0F172A26",
+    "text": "#0F172A",
+    "muted": "#475569",
+    "accent": "#087A55",
+    "accent_hover": "#066646",
+    "accent_text": "#FFFFFF",
+    "ok": "#15703A",
+    "warn": "#8A5205",
+    "err": "#B42323",
+    "info": "#1D4ED8"
+  },
+  "dark": {
+    "background_top": "#0B1018",
+    "background_bottom": "#0E1420",
+    "orbs": [
+      { "x": 0.08, "y": 0.05, "radius": 0.55, "color": "#14B8A659" },
+      { "x": 0.95, "y": 0.18, "radius": 0.50, "color": "#3B82F64D" },
+      { "x": 0.55, "y": 1.05, "radius": 0.65, "color": "#8B5CF64D" }
+    ],
+    "glass": "#1A222EB8",
+    "glass_strong": "#1A222EF2",
+    "glass_border": "#FFFFFF1F",
+    "shadow": "#00000066",
+    "inset": "#FFFFFF0D",
+    "border_strong": "#FFFFFF33",
+    "text": "#E8EDF4",
+    "muted": "#A3B0C2",
+    "accent": "#2DD4A0",
+    "accent_hover": "#4DE0B3",
+    "accent_text": "#06130E",
+    "ok": "#34D399",
+    "warn": "#FBBF24",
+    "err": "#FB8A8A",
+    "info": "#7AB4FB"
+  }
+}

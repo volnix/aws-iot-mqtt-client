@@ -1,0 +1,8 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[env]
+# The TLS crypto library (aws-lc-sys) ships prebuilt assembly objects for Windows x86_64.
+# Using them means Windows builds need only the Visual Studio C++ tools, not NASM.
+# Has no effect on other platforms.
+AWS_LC_SYS_PREBUILT_NASM = "1"

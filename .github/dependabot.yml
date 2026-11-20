@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      aws-sdk:
+        patterns: ["aws-*"]
+      egui:
+        patterns: ["egui*", "eframe", "epaint*", "emath"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

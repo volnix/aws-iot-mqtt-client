@@ -1,0 +1,846 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! AWS account discovery: profiles, the IoT data endpoint, Things, and their certificates.
+//!
+//! Every call here is read-only (Describe*/List*). The only write operations live in
+//! `provision.rs` and run only when the user confirms the "Create certificate" dialog.
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use aws_config::BehaviorVersion;
+use std::sync::Arc;
+use std::time::Instant;
+
+use aws_sdk_iot::config::{ProvideCredentials, Region};
+use aws_sdk_iot::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_iot::operation::RequestId;
+use aws_sdk_iot::types::ServiceType;
+
+use crate::error::{categorize_message, AppError, ErrorCategory};
+use crate::packet_log::{Direction, PacketLogEntry};
+
+/// Timeout applied to each AWS API call (matches the original app's 10 s endpoint timeout).
+pub const API_TIMEOUT: Duration = Duration::from_secs(10);
+/// Things fetched by the single `ListThings` call. Other Things are looked up by exact name.
+pub const THINGS_PAGE_SIZE: i32 = 100;
+
+/// Regions where AWS IoT Core is offered (used to populate the region picker; free text is also allowed).
+pub const IOT_REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+    "ca-central-1",
+    "ca-west-1",
+    "sa-east-1",
+    "mx-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "me-south-1",
+    "me-central-1",
+    "il-central-1",
+    "af-south-1",
+    "ap-east-1",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-southeast-5",
+    "ap-southeast-7",
+    "cn-north-1",
+    "cn-northwest-1",
+    "us-gov-east-1",
+    "us-gov-west-1",
+];
+
+// ---------------------------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------------------------
+
+/// Lists profile names from the shared config and credentials files
+/// (honoring `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`).
+pub fn list_profiles() -> Vec<String> {
+    let home = crate::paths::home_dir().unwrap_or_default();
+    let path = |var: &str, default: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".aws").join(default))
+    };
+    let config = std::fs::read_to_string(path("AWS_CONFIG_FILE", "config")).unwrap_or_default();
+    let creds = std::fs::read_to_string(path("AWS_SHARED_CREDENTIALS_FILE", "credentials"))
+        .unwrap_or_default();
+    parse_profile_names(&config, &creds)
+}
+
+/// Extracts profile names. In the config file, sections are `[default]` or `[profile name]`
+/// (other section types like `[sso-session x]` are skipped); in the credentials file every
+/// section is a profile.
+pub fn parse_profile_names(config: &str, credentials: &str) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for header in section_headers(config) {
+        if header == "default" {
+            names.insert(header.to_owned());
+        } else if let Some(rest) = header.strip_prefix("profile ") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    for header in section_headers(credentials) {
+        if !header.is_empty() && !header.contains(' ') {
+            names.insert(header.to_owned());
+        }
+    }
+    let mut out: Vec<String> = names.into_iter().collect();
+    // Keep "default" first if present.
+    if let Some(pos) = out.iter().position(|n| n == "default") {
+        let d = out.remove(pos);
+        out.insert(0, d);
+    }
+    out
+}
+
+fn section_headers(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter_map(|line| {
+        let l = line.trim();
+        l.strip_prefix('[')?.strip_suffix(']').map(str::trim)
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThingSummary {
+    pub name: String,
+    pub thing_type: Option<String>,
+    pub arn: Option<String>,
+}
+
+/// The first page of `ListThings`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ThingPage {
+    pub things: Vec<ThingSummary>,
+    /// True if the account has more Things than were returned.
+    pub has_more: bool,
+}
+
+/// Receives one entry when each AWS API request is sent and one when its response arrives.
+pub type ApiLogSink = Arc<dyn Fn(PacketLogEntry) + Send + Sync>;
+
+/// A sink that drops log entries (for tests and callers that don't display them).
+pub fn discard_log() -> ApiLogSink {
+    Arc::new(|_| {})
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerIdentity {
+    pub account: String,
+    pub arn: String,
+}
+
+/// Resolved credentials plus an IoT control-plane client.
+#[derive(Clone)]
+pub struct Session {
+    pub client: aws_sdk_iot::Client,
+    pub region: String,
+    /// From `sts:GetCallerIdentity`; `None` if that call failed (it's non-fatal).
+    pub identity: Option<CallerIdentity>,
+    /// Kept so data-plane clients can be built with the same credentials and region.
+    config: Arc<aws_config::SdkConfig>,
+    log: ApiLogSink,
+}
+
+/// Loads the SDK config via the standard chain (env, profile, SSO, process, IMDS/ECS) and
+/// verifies that credentials actually resolve, so failures surface as credential errors.
+pub async fn open_session(
+    profile: Option<&str>,
+    region: Option<&str>,
+    log: ApiLogSink,
+) -> Result<Session, AppError> {
+    let profile = profile.filter(|p| !p.is_empty());
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(p) = profile {
+        loader = loader.profile_name(p);
+    }
+    if let Some(r) = region.filter(|r| !r.is_empty()) {
+        loader = loader.region(Region::new(r.to_owned()));
+    }
+    let config = loader.load().await;
+
+    let region = config.region().map(|r| r.to_string()).ok_or_else(|| {
+        AppError::configuration("No AWS region configured")
+            .with_action("Choose a region, or set one on the selected profile / AWS_REGION.")
+    })?;
+
+    let provider = config
+        .credentials_provider()
+        .ok_or_else(|| AppError::credential("No AWS credentials provider is available"))?;
+
+    const OP: &str = "ResolveCredentials";
+    log(PacketLogEntry::new(
+        Direction::Sent,
+        OP,
+        format!(
+            "profile={} region={region}",
+            profile.unwrap_or("(default chain)")
+        ),
+    ));
+    let started = Instant::now();
+    let resolved = tokio::time::timeout(API_TIMEOUT, provider.provide_credentials()).await;
+    let ms = started.elapsed().as_millis();
+    match resolved {
+        Err(_) => {
+            log(PacketLogEntry::new(
+                Direction::Received,
+                OP,
+                format!("TIMEOUT after {}s", API_TIMEOUT.as_secs()),
+            ));
+            return Err(
+                AppError::credential("Timed out resolving AWS credentials").with_action(
+                    "If this profile uses SSO, run `aws sso login --profile <name>` and retry.",
+                ),
+            );
+        }
+        Ok(Err(e)) => {
+            let details = DisplayErrorContext(&e).to_string();
+            log(PacketLogEntry::new(
+                Direction::Received,
+                OP,
+                format!("ERROR ({ms} ms) {details}"),
+            ));
+            return Err(AppError::credential("Could not resolve AWS credentials")
+                .with_details(details)
+                .with_action(
+                    "Check the selected profile, or run `aws sso login` / refresh your credentials and retry.",
+                ));
+        }
+        Ok(Ok(creds)) => {
+            let kind = match creds.expiry() {
+                Some(t) => format!(
+                    "temporary credentials, expire {}",
+                    chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S")
+                ),
+                None => "long-term credentials".to_owned(),
+            };
+            log(PacketLogEntry::new(
+                Direction::Received,
+                OP,
+                format!(
+                    "OK ({ms} ms) accessKeyId={} {kind}",
+                    mask(creds.access_key_id())
+                ),
+            ));
+        }
+    }
+
+    let mut session = Session {
+        client: aws_sdk_iot::Client::new(&config),
+        region,
+        identity: None,
+        config: Arc::new(config.clone()),
+        log,
+    };
+    let sts = aws_sdk_sts::Client::new(&config);
+    if let Ok(out) = session
+        .call(
+            "GetCallerIdentity",
+            "",
+            sts.get_caller_identity().send(),
+            |o| {
+                format!(
+                    "account={} arn={}",
+                    o.account().unwrap_or("?"),
+                    o.arn().unwrap_or("?")
+                )
+            },
+        )
+        .await
+    {
+        if let (Some(account), Some(arn)) = (out.account(), out.arn()) {
+            session.identity = Some(CallerIdentity {
+                account: account.to_owned(),
+                arn: arn.to_owned(),
+            });
+        }
+    }
+    Ok(session)
+}
+
+/// Shows only the last four characters of an identifier.
+fn mask(s: &str) -> String {
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("****{tail}")
+}
+
+/// A data endpoint the client can connect to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataEndpoint {
+    /// "Default" for the account's `iot:Data-ATS` endpoint, otherwise the domain configuration name.
+    pub label: String,
+    pub domain_name: String,
+    pub is_default: bool,
+    /// Domain configuration status (`ENABLED` / `DISABLED`); `None` for the default endpoint.
+    pub status: Option<String>,
+    /// `ENDPOINT`, `AWS_MANAGED`, or `CUSTOMER_MANAGED`.
+    pub domain_type: Option<String>,
+}
+
+impl DataEndpoint {
+    pub fn is_enabled(&self) -> bool {
+        self.status.as_deref().is_none_or(|s| s == "ENABLED")
+    }
+}
+
+/// Endpoints found, plus a non-fatal warning if some couldn't be read.
+#[derive(Debug, Clone)]
+pub struct EndpointDiscovery {
+    pub endpoints: Vec<DataEndpoint>,
+    pub warning: Option<AppError>,
+}
+
+pub const DEFAULT_ENDPOINT_LABEL: &str = "Default";
+
+impl Session {
+    pub fn account(&self) -> Option<&str> {
+        self.identity.as_ref().map(|i| i.account.as_str())
+    }
+
+    /// AWS partition (`aws`, `aws-cn`, `aws-us-gov`), from the caller ARN; defaults to `aws`.
+    pub fn partition(&self) -> &str {
+        self.identity
+            .as_ref()
+            .and_then(|i| i.arn.split(':').nth(1))
+            .filter(|p| !p.is_empty())
+            .unwrap_or("aws")
+    }
+
+    /// Sends one AWS request with a timeout, logging the request and the response.
+    /// `request` describes the parameters; never put secrets in it or in `summarize`'s output.
+    pub(crate) async fn call<T, E>(
+        &self,
+        op: &str,
+        request: impl Into<String>,
+        fut: impl std::future::Future<Output = Result<T, SdkError<E>>>,
+        summarize: impl FnOnce(&T) -> String,
+    ) -> Result<T, AppError>
+    where
+        T: RequestId,
+        E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+    {
+        (self.log)(PacketLogEntry::new(Direction::Sent, op, request));
+        let started = Instant::now();
+        let result = tokio::time::timeout(API_TIMEOUT, fut).await;
+        let ms = started.elapsed().as_millis();
+        let request_id =
+            |id: Option<&str>| id.map(|i| format!(" requestId={i}")).unwrap_or_default();
+        match result {
+            Err(_) => {
+                (self.log)(PacketLogEntry::new(
+                    Direction::Received,
+                    op,
+                    format!("TIMEOUT after {}s", API_TIMEOUT.as_secs()),
+                ));
+                Err(AppError::network(format!(
+                    "{op} timed out after {} seconds",
+                    API_TIMEOUT.as_secs()
+                )))
+            }
+            Ok(Err(e)) => {
+                let what = match (e.code(), e.message()) {
+                    (Some(c), Some(m)) => format!("{c}: {m}"),
+                    (Some(c), None) => c.to_owned(),
+                    _ => DisplayErrorContext(&e).to_string(),
+                };
+                (self.log)(PacketLogEntry::new(
+                    Direction::Received,
+                    op,
+                    format!("ERROR ({ms} ms){} {what}", request_id(e.request_id())),
+                ));
+                Err(map_sdk_error(op, e))
+            }
+            Ok(Ok(v)) => {
+                let summary = summarize(&v);
+                let sep = if summary.is_empty() { "" } else { " " };
+                (self.log)(PacketLogEntry::new(
+                    Direction::Received,
+                    op,
+                    format!("OK ({ms} ms){}{sep}{summary}", request_id(v.request_id())),
+                ));
+                Ok(v)
+            }
+        }
+    }
+
+    /// The default `iot:Data-ATS` endpoint plus every enabled-or-disabled DATA domain
+    /// configuration. AWS-managed `iot:*` configurations are skipped: the default is covered
+    /// by `DescribeEndpoint`, and the legacy `iot:Data` endpoint uses a CA this app doesn't trust.
+    pub async fn list_data_endpoints(&self) -> Result<EndpointDiscovery, AppError> {
+        let mut endpoints = Vec::new();
+        let mut problems = Vec::new();
+
+        let default = self
+            .call(
+                "DescribeEndpoint",
+                "endpointType=iot:Data-ATS",
+                self.client
+                    .describe_endpoint()
+                    .endpoint_type("iot:Data-ATS")
+                    .send(),
+                |o| format!("endpointAddress={}", o.endpoint_address().unwrap_or("")),
+            )
+            .await;
+        let default_error = match default {
+            Ok(out) => match out.endpoint_address().filter(|a| !a.is_empty()) {
+                Some(addr) => {
+                    endpoints.push(DataEndpoint {
+                        label: DEFAULT_ENDPOINT_LABEL.to_owned(),
+                        domain_name: addr.to_owned(),
+                        is_default: true,
+                        status: None,
+                        domain_type: None,
+                    });
+                    None
+                }
+                None => Some(AppError::network(
+                    "No endpoint address returned from AWS IoT",
+                )),
+            },
+            Err(e) => Some(e),
+        };
+
+        match self.list_domain_configuration_names().await {
+            Ok(names) => {
+                for name in names {
+                    match self.describe_domain_configuration(&name).await {
+                        Ok(Some(ep)) => endpoints.push(ep),
+                        Ok(None) => {}
+                        Err(e) => problems.push(format!("{name}: {}", e.summary())),
+                    }
+                }
+            }
+            Err(e) => problems.push(e.summary()),
+        }
+
+        if endpoints.is_empty() {
+            return Err(default_error.unwrap_or_else(|| {
+                AppError::network("No IoT data endpoints found").with_details(problems.join("\n"))
+            }));
+        }
+        if let Some(e) = &default_error {
+            problems.insert(0, e.summary());
+        }
+        let warning = (!problems.is_empty()).then(|| {
+            AppError::credential("Some endpoints could not be listed")
+                .with_details(problems.join("\n"))
+                .with_action(
+                    "Custom domains need iot:ListDomainConfigurations and iot:DescribeDomainConfiguration. You can still type an endpoint manually.",
+                )
+        });
+        Ok(EndpointDiscovery { endpoints, warning })
+    }
+
+    async fn list_domain_configuration_names(&self) -> Result<Vec<String>, AppError> {
+        let mut names = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let out = self
+                .call(
+                    "ListDomainConfigurations",
+                    format!(
+                        "serviceType=DATA{}",
+                        marker.as_ref().map(|_| " marker=…").unwrap_or("")
+                    ),
+                    self.client
+                        .list_domain_configurations()
+                        .service_type(ServiceType::Data)
+                        .page_size(250)
+                        .set_marker(marker.take())
+                        .send(),
+                    |o| format!("{} domain configurations", o.domain_configurations().len()),
+                )
+                .await?;
+            names.extend(
+                out.domain_configurations()
+                    .iter()
+                    .filter_map(|d| d.domain_configuration_name())
+                    .filter(|n| !n.starts_with("iot:"))
+                    .map(str::to_owned),
+            );
+            marker = out
+                .next_marker()
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned);
+            if marker.is_none() {
+                break;
+            }
+        }
+        names.sort_by_key(|n| n.to_lowercase());
+        Ok(names)
+    }
+
+    async fn describe_domain_configuration(
+        &self,
+        name: &str,
+    ) -> Result<Option<DataEndpoint>, AppError> {
+        let out = self
+            .call(
+                "DescribeDomainConfiguration",
+                format!("domainConfigurationName={name}"),
+                self.client
+                    .describe_domain_configuration()
+                    .domain_configuration_name(name)
+                    .send(),
+                |o| {
+                    format!(
+                        "domainName={} status={}",
+                        o.domain_name().unwrap_or(""),
+                        o.domain_configuration_status()
+                            .map(|s| s.as_str())
+                            .unwrap_or("?")
+                    )
+                },
+            )
+            .await?;
+        Ok(out
+            .domain_name()
+            .filter(|d| !d.is_empty())
+            .map(|domain| DataEndpoint {
+                label: name.to_owned(),
+                domain_name: domain.to_owned(),
+                is_default: false,
+                status: out
+                    .domain_configuration_status()
+                    .map(|s| s.as_str().to_owned()),
+                domain_type: out.domain_type().map(|t| t.as_str().to_owned()),
+            }))
+    }
+
+    /// One `ListThings` call (no pagination), sorted by name. Large fleets aren't listed in
+    /// full; use [`Session::describe_thing`] for a Thing that isn't on this page.
+    pub async fn list_things_first_page(&self) -> Result<ThingPage, AppError> {
+        let out = self
+            .call(
+                "ListThings",
+                format!("maxResults={THINGS_PAGE_SIZE}"),
+                self.client
+                    .list_things()
+                    .max_results(THINGS_PAGE_SIZE)
+                    .send(),
+                |o| {
+                    format!(
+                        "{} things{}",
+                        o.things().len(),
+                        if o.next_token().is_some_and(|t| !t.is_empty()) {
+                            " (more available)"
+                        } else {
+                            ""
+                        }
+                    )
+                },
+            )
+            .await?;
+        let mut things: Vec<ThingSummary> = out
+            .things()
+            .iter()
+            .filter_map(|t| {
+                Some(ThingSummary {
+                    name: t.thing_name()?.to_owned(),
+                    thing_type: t.thing_type_name().map(str::to_owned),
+                    arn: t.thing_arn().map(str::to_owned),
+                })
+            })
+            .collect();
+        things.sort_by_key(|t| t.name.to_lowercase());
+        Ok(ThingPage {
+            things,
+            has_more: out.next_token().is_some_and(|t| !t.is_empty()),
+        })
+    }
+
+    /// `DescribeThing` for a name the user typed.
+    pub async fn describe_thing(&self, thing_name: &str) -> Result<ThingSummary, AppError> {
+        let out = self
+            .call(
+                "DescribeThing",
+                format!("thingName={thing_name}"),
+                self.client.describe_thing().thing_name(thing_name).send(),
+                |o| format!("thingArn={}", o.thing_arn().unwrap_or("?")),
+            )
+            .await
+            .map_err(|e| {
+                if e.message.contains("ResourceNotFoundException") {
+                    AppError::configuration(format!(
+                        "Thing \"{thing_name}\" doesn't exist in {}",
+                        self.region
+                    ))
+                    .with_action("Thing names are case-sensitive. Check the name and region.")
+                } else {
+                    e
+                }
+            })?;
+        Ok(ThingSummary {
+            name: out.thing_name().unwrap_or(thing_name).to_owned(),
+            thing_type: out.thing_type_name().map(str::to_owned),
+            arn: out.thing_arn().map(str::to_owned),
+        })
+    }
+
+    fn data_client(&self, data_endpoint: Option<&str>) -> aws_sdk_iotdataplane::Client {
+        let mut builder = aws_sdk_iotdataplane::config::Builder::from(self.config.as_ref());
+        if let Some(ep) = data_endpoint.filter(|e| !e.is_empty()) {
+            builder = builder.endpoint_url(format!("https://{ep}"));
+        }
+        aws_sdk_iotdataplane::Client::from_conf(builder.build())
+    }
+
+    /// `GetConnection` (IoT data plane) for a connected client. `data_endpoint` should be the
+    /// account's default `iot:Data-ATS` hostname.
+    pub async fn get_connection(
+        &self,
+        data_endpoint: Option<&str>,
+        client_id: &str,
+        include_socket_information: bool,
+    ) -> Result<ConnectionInfo, AppError> {
+        let client = self.data_client(data_endpoint);
+        let out = self
+            .call(
+                "GetConnection",
+                format!(
+                    "clientId={client_id} includeSocketInformation={include_socket_information}"
+                ),
+                client
+                    .get_connection()
+                    .client_id(client_id)
+                    .include_socket_information(include_socket_information)
+                    .send(),
+                |o| {
+                    format!(
+                        "connected={} cleanSession={}",
+                        o.connected(),
+                        o.clean_session()
+                    )
+                },
+            )
+            .await?;
+        // Absent numeric fields come back as 0.
+        let millis = |ms: i64| {
+            (ms > 0)
+                .then(|| chrono::DateTime::from_timestamp_millis(ms))
+                .flatten()
+                .map(|d| d.with_timezone(&chrono::Local))
+        };
+        Ok(ConnectionInfo {
+            client_id: out.client_id().map(str::to_owned),
+            thing_name: out.thing_name().map(str::to_owned),
+            connected: out.connected(),
+            clean_session: out.clean_session(),
+            keep_alive_secs: out.keep_alive_duration(),
+            session_expiry_secs: out.session_expiry(),
+            connected_since: millis(out.connected_since()),
+            disconnected_since: millis(out.disconnected_since()),
+            disconnect_reason: out.disconnect_reason().map(str::to_owned),
+            source: socket(out.source_ip(), out.source_port()),
+            target: socket(out.target_ip(), out.target_port()),
+            vpc_endpoint_id: out.vpc_endpoint_id().map(str::to_owned),
+        })
+    }
+
+    /// `ListSubscriptions` (IoT data plane): every subscription the broker holds for the client.
+    pub async fn list_subscriptions(
+        &self,
+        data_endpoint: Option<&str>,
+        client_id: &str,
+    ) -> Result<Vec<SubscriptionInfo>, AppError> {
+        let client = self.data_client(data_endpoint);
+        let mut subs = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let out = self
+                .call(
+                    "ListSubscriptions",
+                    format!(
+                        "clientId={client_id} maxResults=200{}",
+                        token.as_ref().map(|_| " nextToken=…").unwrap_or("")
+                    ),
+                    client
+                        .list_subscriptions()
+                        .client_id(client_id)
+                        .max_results(200)
+                        .set_next_token(token.take())
+                        .send(),
+                    |o| format!("{} subscriptions", o.subscriptions().len()),
+                )
+                .await?;
+            subs.extend(out.subscriptions().iter().map(|s| SubscriptionInfo {
+                topic_filter: s.topic_filter().to_owned(),
+                qos: s.qos(),
+            }));
+            token = out
+                .next_token()
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned);
+            if token.is_none() {
+                break;
+            }
+        }
+        subs.sort_by(|a, b| a.topic_filter.cmp(&b.topic_filter));
+        Ok(subs)
+    }
+}
+
+fn socket(ip: Option<&str>, port: i32) -> Option<String> {
+    let ip = ip.filter(|i| !i.is_empty())?;
+    Some(if port > 0 {
+        format!("{ip}:{port}")
+    } else {
+        ip.to_owned()
+    })
+}
+
+/// Broker-side view of a client connection (`GetConnection`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectionInfo {
+    pub client_id: Option<String>,
+    pub thing_name: Option<String>,
+    pub connected: bool,
+    pub clean_session: bool,
+    pub keep_alive_secs: i32,
+    pub session_expiry_secs: i64,
+    pub connected_since: Option<chrono::DateTime<chrono::Local>>,
+    pub disconnected_since: Option<chrono::DateTime<chrono::Local>>,
+    pub disconnect_reason: Option<String>,
+    /// `ip:port` of the client, when socket information was requested and authorized.
+    pub source: Option<String>,
+    /// `ip:port` of the AWS IoT endpoint.
+    pub target: Option<String>,
+    pub vpc_endpoint_id: Option<String>,
+}
+
+/// One subscription held by the broker for a client (`ListSubscriptions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionInfo {
+    pub topic_filter: String,
+    pub qos: i32,
+}
+
+fn map_sdk_error<E>(op: &str, err: SdkError<E>) -> AppError
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let code = err.code().map(str::to_owned);
+    let details = DisplayErrorContext(&err).to_string();
+    let category = match code.as_deref() {
+        Some(
+            "UnauthorizedException"
+            | "AccessDeniedException"
+            | "AccessDenied"
+            | "ExpiredToken"
+            | "ExpiredTokenException"
+            | "UnrecognizedClientException"
+            | "InvalidClientTokenId"
+            | "InvalidSignatureException"
+            | "SignatureDoesNotMatch",
+        ) => ErrorCategory::Credential,
+        Some(_) => ErrorCategory::Configuration,
+        None => match categorize_message(&details) {
+            ErrorCategory::Configuration => ErrorCategory::Network,
+            c => c,
+        },
+    };
+    let message = match &code {
+        Some(c) => format!("{op} failed: {c}"),
+        None => format!("{op} failed"),
+    };
+    let err = AppError::new(category, message).with_details(details);
+    if category == ErrorCategory::Credential {
+        err.with_action(format!(
+            "Ensure the credentials are current and allow iot:{op}."
+        ))
+    } else {
+        err
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_profiles_from_both_files() {
+        let config = "\
+[default]
+region = us-east-1
+
+[profile dev]
+region = us-west-2
+[ profile  prod-ro ]
+[sso-session corp]
+sso_start_url = https://example
+";
+        let creds = "[default]\naws_access_key_id=x\n[legacy]\n";
+        assert_eq!(
+            parse_profile_names(config, creds),
+            ["default", "dev", "legacy", "prod-ro"]
+        );
+    }
+
+    #[test]
+    fn parses_empty_files() {
+        assert!(parse_profile_names("", "").is_empty());
+    }
+
+    #[test]
+    fn socket_formatting() {
+        assert_eq!(
+            socket(Some("10.0.0.1"), 8883).as_deref(),
+            Some("10.0.0.1:8883")
+        );
+        assert_eq!(socket(Some("10.0.0.1"), 0).as_deref(), Some("10.0.0.1"));
+        assert_eq!(socket(None, 1), None);
+        assert_eq!(socket(Some(""), 1), None);
+    }
+
+    #[test]
+    fn masks_identifiers() {
+        assert_eq!(mask("AKIAABCDEFGH1234"), "****1234");
+        assert_eq!(mask("ab"), "****ab");
+    }
+
+    #[test]
+    fn disabled_endpoints_are_not_enabled() {
+        let mut ep = DataEndpoint {
+            label: "custom".into(),
+            domain_name: "iot.example.com".into(),
+            is_default: false,
+            status: Some("DISABLED".into()),
+            domain_type: Some("CUSTOMER_MANAGED".into()),
+        };
+        assert!(!ep.is_enabled());
+        ep.status = None;
+        assert!(ep.is_enabled());
+    }
+}
