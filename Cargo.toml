@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Cross-platform desktop MQTT 3.1.1/5 client for AWS IoT Core"
-authors = ["Amazon Web Services"]
+authors = ["Nick Volgas"]
 license = "Apache-2.0"
-repository = "https://github.com/aws-solutions/aws-iot-mqtt-client"
+repository = "https://github.com/volnix/aws-iot-mqtt-client"
 readme = "README.md"
-keywords = ["aws", "iot", "mqtt", "desktop", "egui"]
+keywords = ["aws", "iot", "mqtt", "desktop"]
 categories = ["gui", "network-programming"]
 publish = false
 
@@ -17,15 +17,16 @@ name = "aws-iot-mqtt-client"
 path = "src/main.rs"
 
 [dependencies]
+# The AWS SDK crates' default "rustls" feature pulls in a legacy HTTPS stack (rustls 0.21, hyper
+# 0.14) with known advisories; "default-https-client" is the current rustls 0.23 client.
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence", "accesskit"] }
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 aws-config = { version = "1.13", features = ["behavior-version-latest"] }
-aws-sdk-iot = "1.135"
-aws-sdk-sts = "1.124"
-aws-sdk-iotdataplane = "1.121"
+aws-sdk-iot = { version = "1.135", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1.124", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-iotdataplane = { version = "1.121", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-rustls-pemfile = "2.2"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 webpki-roots = "1"
 sha2 = "0.11"
@@ -34,7 +35,7 @@ rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "t
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jiff = "1"
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }

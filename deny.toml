@@ -5,8 +5,15 @@
 all-features = false
 
 [advisories]
-# RustSec advisories fail the build; add an `ignore` entry with a justification if needed.
-ignore = []
+# RustSec advisories fail the build. Every ignore below needs a reason and should be revisited
+# when the dependency that causes it is updated.
+ignore = [
+    { id = "RUSTSEC-2026-0049", reason = "CRL distribution point matching: rustls-webpki 0.102 is pulled in only by rumqttc 0.25 (the latest release), which uses it solely for an error-type conversion. All certificate verification in this app goes through rustls 0.23 with rustls-webpki 0.103, via the ClientConfig built in src/mqtt.rs. Remove when rumqttc drops 0.102." },
+    { id = "RUSTSEC-2026-0098", reason = "URI name constraints: rustls-webpki 0.102 is pulled in only by rumqttc 0.25 (the latest release), which uses it solely for an error-type conversion. All certificate verification in this app goes through rustls 0.23 with rustls-webpki 0.103, via the ClientConfig built in src/mqtt.rs. Remove when rumqttc drops 0.102." },
+    { id = "RUSTSEC-2026-0099", reason = "wildcard name constraints: rustls-webpki 0.102 is pulled in only by rumqttc 0.25 (the latest release), which uses it solely for an error-type conversion. All certificate verification in this app goes through rustls 0.23 with rustls-webpki 0.103, via the ClientConfig built in src/mqtt.rs. Remove when rumqttc drops 0.102." },
+    { id = "RUSTSEC-2026-0104", reason = "CRL parsing panic: rustls-webpki 0.102 is pulled in only by rumqttc 0.25 (the latest release), which uses it solely for an error-type conversion. All certificate verification in this app goes through rustls 0.23 with rustls-webpki 0.103, via the ClientConfig built in src/mqtt.rs. Remove when rumqttc drops 0.102." },
+    { id = "RUSTSEC-2026-0382", reason = "distrusted intermediates: rustls-webpki 0.102 is pulled in only by rumqttc 0.25 (the latest release), which uses it solely for an error-type conversion. All certificate verification in this app goes through rustls 0.23 with rustls-webpki 0.103, via the ClientConfig built in src/mqtt.rs. Remove when rumqttc drops 0.102." },
+]
 
 [licenses]
 # Permissive licenses only. A crate offered under "X OR Y" passes if either is allowed.

@@ -30,7 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = "aws-iot-mqtt-client"
 APP_NAME = "AWS IoT MQTT Client"
-BUNDLE_ID = "io.github.aws-solutions.aws-iot-mqtt-client"
+BUNDLE_ID = "io.github.volnix.aws-iot-mqtt-client"
 MACOS_MIN = "11.0"
 DOCS = ["LICENSE", "NOTICE", "README.md"]
 

@@ -13,8 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Local};
+use jiff::ZonedDateTime;
 use rumqttc::{Outgoing, TlsConfiguration, Transport};
+use rustls::pki_types::pem::{self, PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -194,7 +196,7 @@ impl ConnectionConfig {
 
 #[derive(Debug, Clone)]
 pub struct ReceivedMessage {
-    pub timestamp: DateTime<Local>,
+    pub timestamp: ZonedDateTime,
     pub topic: String,
     pub payload: Vec<u8>,
     pub qos: u8,
@@ -310,7 +312,7 @@ impl Reporter {
         (self.sink)(
             self.id,
             MqttEvent::Message(ReceivedMessage {
-                timestamp: Local::now(),
+                timestamp: ZonedDateTime::now(),
                 topic,
                 payload,
                 qos,
@@ -749,7 +751,7 @@ connected with the same client ID.";
 fn root_store() -> RootCertStore {
     let mut roots = RootCertStore::empty();
     let pem = AMAZON_ROOT_CAS.concat();
-    for cert in rustls_pemfile::certs(&mut pem.as_bytes()).flatten() {
+    for cert in CertificateDer::pem_slice_iter(pem.as_bytes()).flatten() {
         // Bundled certificates are verified by a unit test; a failure here can't happen.
         let _ = roots.add(cert);
     }
@@ -763,7 +765,7 @@ pub fn build_tls_config(
     certificate_pem: &[u8],
     private_key_pem: &[u8],
 ) -> Result<Arc<ClientConfig>, AppError> {
-    let certs = rustls_pemfile::certs(&mut &certificate_pem[..])
+    let certs = CertificateDer::pem_slice_iter(certificate_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
             AppError::authentication("Could not read the certificate").with_details(e.to_string())
@@ -773,11 +775,12 @@ pub fn build_tls_config(
             "The certificate file has no CERTIFICATE block",
         ));
     }
-    let key = rustls_pemfile::private_key(&mut &private_key_pem[..])
-        .map_err(|e| {
-            AppError::authentication("Could not read the private key").with_details(e.to_string())
-        })?
-        .ok_or_else(|| AppError::authentication("The private key file has no PRIVATE KEY block"))?;
+    let key = PrivateKeyDer::from_pem_slice(private_key_pem).map_err(|e| match e {
+        pem::Error::NoItemsFound => {
+            AppError::authentication("The private key file has no PRIVATE KEY block")
+        }
+        e => AppError::authentication("Could not read the private key").with_details(e.to_string()),
+    })?;
 
     let config = ClientConfig::builder()
         .with_root_certificates(root_store())
@@ -971,7 +974,7 @@ mod tests {
     #[test]
     fn bundled_cas_parse() {
         let pem = AMAZON_ROOT_CAS.concat();
-        let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes())
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(pem.as_bytes())
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(certs.len(), 4);
