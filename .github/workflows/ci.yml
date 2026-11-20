@@ -19,7 +19,7 @@ jobs:
     name: Format, lint, notices
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
       - name: Install Rust
@@ -46,7 +46,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
@@ -68,7 +68,7 @@ jobs:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
       - name: Install Rust (rust-version from Cargo.toml)
@@ -82,7 +82,7 @@ jobs:
     name: Licenses, advisories, sources
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
