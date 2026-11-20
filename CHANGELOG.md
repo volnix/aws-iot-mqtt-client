@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Clicking the text of a collapsible section (such as **Advanced** or **More**) now opens it,
+  not just clicking its arrow.
+
+### Changed
+
+- Icon-only buttons (refresh, unsubscribe, theme, close) now have names for screen readers.
+- Updated the file dialog library (`rfd`) to 0.18.
+- The project is maintained by Nick Volgas. Copyright notices, the Code of Conduct, and
+  security reporting were updated to match.
+
+### Added
+
+- Offline end-to-end tests: a fake of the AWS endpoints, a local TLS MQTT test broker, and UI
+  tests that drive the real window. Line coverage went from about 60% to 92%.
+
 ## [1.0.0] - 2026-11-20
 
 The initial release of AWS IoT MQTT Client: a desktop MQTT client for AWS IoT Core with a

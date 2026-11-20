@@ -1,4 +1,4 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2026 Nick Volgas
 // SPDX-License-Identifier: Apache-2.0
 
 //! egui front end. All network work runs on the tokio runtime; results come back over a channel.
@@ -352,6 +352,13 @@ pub struct MqttApp {
 
     provision: Option<ProvisionDialog>,
     notice: Option<String>,
+
+    /// Tests: open sessions from this SDK config (an offline fake) instead of the real chain.
+    #[cfg(test)]
+    test_sdk_config: Option<aws_config::SdkConfig>,
+    /// Tests: trust these roots (a local test broker's CA) instead of the bundled ones.
+    #[cfg(test)]
+    test_tls_roots: Option<rustls::RootCertStore>,
 }
 
 impl MqttApp {
@@ -405,6 +412,10 @@ impl MqttApp {
             live: LiveState::default(),
             provision: None,
             notice: None,
+            #[cfg(test)]
+            test_sdk_config: None,
+            #[cfg(test)]
+            test_tls_roots: None,
             settings,
         };
         if let Some(p) = app.settings.cert_path.clone() {
@@ -467,12 +478,21 @@ impl MqttApp {
         let log = self.api_log_sink(ctx);
         let tx = self.tx.clone();
         let ctx = ctx.clone();
+        #[cfg(test)]
+        let test_config = self.test_sdk_config.clone();
         self.rt.spawn(async move {
             let send = |msg| {
                 let _ = tx.send(msg);
                 ctx.request_repaint();
             };
-            let session = match aws::open_session(Some(&profile), Some(&region), log).await {
+            #[cfg(test)]
+            let opened = match test_config {
+                Some(config) => aws::session_from_config(config, Some(&profile), log).await,
+                None => aws::open_session(Some(&profile), Some(&region), log).await,
+            };
+            #[cfg(not(test))]
+            let opened = aws::open_session(Some(&profile), Some(&region), log).await;
+            let session = match opened {
                 Ok(s) => s,
                 Err(e) => {
                     return send(AppMsg::Session {
@@ -572,7 +592,7 @@ impl MqttApp {
         });
 
         let (endpoint, client_id) = (config.endpoint.clone(), config.client_id.clone());
-        match Connection::start(self.rt.handle(), id, config, sink) {
+        match self.start_connection(id, config, sink) {
             Ok(conn) => {
                 self.connection = Some(conn);
                 self.connected_as = Some((endpoint, client_id));
@@ -584,6 +604,31 @@ impl MqttApp {
                 self.connection_error = Some(e);
             }
         }
+    }
+
+    fn start_connection(
+        &self,
+        id: u64,
+        config: ConnectionConfig,
+        sink: EventSink,
+    ) -> Result<Connection, AppError> {
+        #[cfg(test)]
+        if let Some(roots) = self.test_tls_roots.clone() {
+            config.validate()?;
+            let tls = mqtt::build_tls_config_with_roots(
+                &config.certificate_pem,
+                &config.private_key_pem,
+                roots,
+            )?;
+            return Ok(Connection::start_with_tls(
+                self.rt.handle(),
+                id,
+                config,
+                tls,
+                sink,
+            ));
+        }
+        Connection::start(self.rt.handle(), id, config, sink)
     }
 
     fn drain_messages(&mut self, ctx: &egui::Context) {
@@ -2233,6 +2278,26 @@ impl MqttApp {
 
 impl eframe::App for MqttApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(c) = &self.connection {
+            c.disconnect();
+            // Give the DISCONNECT a moment to flush before the runtime is torn down.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+}
+
+impl MqttApp {
+    /// One frame of the whole window. Separate from [`eframe::App::ui`] so tests can drive it
+    /// without an eframe window.
+    fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if let Some(watcher) = &mut self.theme_watcher {
             watcher.poll(&ctx);
@@ -2305,18 +2370,6 @@ impl eframe::App for MqttApp {
         egui::CentralPanel::no_frame()
             .frame(egui::Frame::new().inner_margin(Margin::same(g)))
             .show(ui, |ui| self.main_column(ui));
-    }
-
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, &self.settings);
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(c) = &self.connection {
-            c.disconnect();
-            // Give the DISCONNECT a moment to flush before the runtime is torn down.
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
     }
 }
 
@@ -2586,6 +2639,9 @@ fn missing_requirements(
     }
     missing
 }
+
+#[cfg(test)]
+mod ui_tests;
 
 #[cfg(test)]
 mod tests {

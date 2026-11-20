@@ -98,7 +98,8 @@ After changing dependencies, run `python3 scripts/generate_notice.py` and commit
 ### Test coverage
 
 CI also measures coverage with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) and
-uploads it to [Codecov](https://about.codecov.io), which powers the README badge. Codecov is free for public repos. To enable it once:
+uploads it to [Codecov](https://about.codecov.io), which powers the README badge. Codecov is
+free for public repos. To enable it once:
 
 1. Sign in at [codecov.io](https://codecov.io) with GitHub and add this repository.
 2. Copy the repository's upload token from Codecov.
@@ -107,6 +108,12 @@ uploads it to [Codecov](https://about.codecov.io), which powers the README badge
 
 Until the secret exists, the upload step is skipped without failing CI. To see coverage locally:
 `cargo install cargo-llvm-cov`, then `cargo llvm-cov --open`.
+
+The tests run offline. AWS calls go to an in-process fake of the AWS endpoints, and MQTT
+connections go to a small TLS test broker on `127.0.0.1`, both in `src/test_support.rs`. UI
+tests in `src/app/ui_tests.rs` drive the real window with
+[`egui_kittest`](https://crates.io/crates/egui_kittest), clicking widgets by their accessible
+labels.
 
 ### Security advisories
 

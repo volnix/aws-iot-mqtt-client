@@ -1,4 +1,4 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2026 Nick Volgas
 // SPDX-License-Identifier: Apache-2.0
 
 //! Creating a device certificate for a Thing (or a bare client ID), with an existing or new
@@ -704,5 +704,286 @@ mod tests {
         let e = describe_partial_failure(AppError::credential("AttachPolicy failed"), &outcome);
         assert!(e.details.unwrap().contains("✔ Created policy p"));
         assert_eq!(e.message, "AttachPolicy failed");
+    }
+}
+
+/// The AWS side of provisioning, against an in-process fake (no network).
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::error::ErrorCategory;
+    use crate::test_support::FakeAws;
+    use serde_json::json;
+
+    const CERT_ARN: &str = "arn:aws:iot:us-east-1:123456789012:cert/abc123";
+    const PRIVATE_KEY: &str =
+        "-----BEGIN RSA PRIVATE KEY-----\nNOT-A-REAL-KEY\n-----END RSA PRIVATE KEY-----\n";
+
+    fn created_cert() -> serde_json::Value {
+        json!({
+            "certificateArn": CERT_ARN,
+            "certificateId": "abc123",
+            "certificatePem": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n",
+            "keyPair": { "PublicKey": "PUBLIC", "PrivateKey": PRIVATE_KEY },
+        })
+    }
+
+    fn request(identity: Identity, policy: PolicyChoice, root: &Path) -> ProvisionRequest {
+        ProvisionRequest {
+            identity,
+            policy,
+            storage_root: root.to_owned(),
+        }
+    }
+
+    fn new_policy(identity: &Identity) -> PolicyChoice {
+        PolicyChoice::New {
+            name: "dev-policy".into(),
+            document: default_policy_document(identity, &ArnScope::new("aws", "us-east-1", None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_and_pretty_prints_a_policy() {
+        let fake = FakeAws::new().json(
+            "GET",
+            "/policies/dev-policy",
+            json!({
+                "policyName": "dev-policy",
+                "defaultVersionId": "1",
+                "policyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+            }),
+        );
+        let (session, log) = fake.session().await;
+        let doc = session.get_policy_document("dev-policy").await.unwrap();
+        assert!(doc.contains("\n  \"Statement\""), "{doc}");
+        assert!(
+            log.text().contains("defaultVersionId=1 document=<"),
+            "{}",
+            log.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_without_a_document_is_an_error() {
+        let fake = FakeAws::new().json("GET", "/policies/empty", json!({ "policyName": "empty" }));
+        let (session, _) = fake.session().await;
+        let err = session.get_policy_document("empty").await.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Network);
+    }
+
+    #[tokio::test]
+    async fn lists_policies_across_pages_sorted() {
+        let fake = FakeAws::new()
+            .json_once(
+                "GET",
+                "/policies",
+                json!({ "policies": [{ "policyName": "zeta" }], "nextMarker": "m2" }),
+            )
+            .json(
+                "GET",
+                "/policies",
+                json!({ "policies": [{ "policyName": "Alpha" }, { "policyArn": "no-name" }] }),
+            );
+        let (session, _) = fake.session().await;
+        assert_eq!(session.list_policies().await.unwrap(), ["Alpha", "zeta"]);
+        let pages = fake.requests_to("GET", "/policies");
+        assert_eq!(pages.len(), 2);
+        assert!(pages[1].query.contains("marker=m2"), "{}", pages[1].query);
+    }
+
+    #[tokio::test]
+    async fn creates_policy_certificate_and_attachments_for_a_thing() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::Thing("sensor-1".into());
+        let fake = FakeAws::new()
+            .json(
+                "POST",
+                "/policies/dev-policy",
+                json!({ "policyArn": "arn:policy" }),
+            )
+            .json("POST", "/keys-and-certificate", created_cert())
+            .json("PUT", "/target-policies/dev-policy", json!({}))
+            .json("PUT", "/things/sensor-1/principals", json!({}));
+        let (session, log) = fake.session().await;
+        let req = request(identity.clone(), new_policy(&identity), dir.path());
+        let outcome = session.provision_certificate(&req).await;
+
+        assert!(outcome.is_success(), "{:?}", outcome.error);
+        assert_eq!(outcome.completed.len(), 5, "{:?}", outcome.completed);
+        let saved = outcome.saved.unwrap();
+        assert_eq!(saved.certificate_id, "abc123");
+        assert_eq!(saved.certificate_arn, CERT_ARN);
+        assert_eq!(fs::read_to_string(&saved.key_path).unwrap(), PRIVATE_KEY);
+        assert!(saved.directory.starts_with(dir.path().join("sensor-1")));
+        assert!(saved.directory.join(PUBLIC_KEY_FILE).is_file());
+
+        let order: Vec<_> = fake.requests().iter().map(|r| r.path.clone()).collect();
+        let pos = |p: &str| order.iter().position(|o| o == p).unwrap();
+        assert!(pos("/policies/dev-policy") < pos("/keys-and-certificate"));
+        assert!(pos("/keys-and-certificate") < pos("/target-policies/dev-policy"));
+        assert!(pos("/target-policies/dev-policy") < pos("/things/sensor-1/principals"));
+
+        let created = &fake.requests_to("POST", "/policies/dev-policy")[0];
+        assert!(
+            created.body.contains("Thing.IsAttached"),
+            "{}",
+            created.body
+        );
+        let attach = &fake.requests_to("PUT", "/target-policies/dev-policy")[0];
+        assert!(attach.body.contains(CERT_ARN), "{}", attach.body);
+
+        let text = log.text();
+        assert!(
+            !text.contains("NOT-A-REAL-KEY"),
+            "private key logged: {text}"
+        );
+        assert!(text.contains("private key received, not logged"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn existing_policy_for_a_client_id_skips_create_and_thing_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeAws::new()
+            .json("POST", "/keys-and-certificate", created_cert())
+            .json("PUT", "/target-policies/shared", json!({}));
+        let (session, _) = fake.session().await;
+        let req = request(
+            Identity::ClientId("tester".into()),
+            PolicyChoice::Existing("shared".into()),
+            dir.path(),
+        );
+        let outcome = session.provision_certificate(&req).await;
+        assert!(outcome.is_success(), "{:?}", outcome.error);
+        assert_eq!(outcome.completed.len(), 3, "{:?}", outcome.completed);
+        assert!(outcome
+            .saved
+            .unwrap()
+            .directory
+            .starts_with(dir.path().join("client-tester")));
+        let paths: Vec<_> = fake.requests().iter().map(|r| r.path.clone()).collect();
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/policies")),
+            "{paths:?}"
+        );
+        assert!(!paths.iter().any(|p| p.starts_with("/things")), "{paths:?}");
+    }
+
+    #[tokio::test]
+    async fn invalid_input_fails_before_any_aws_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeAws::new();
+        let (session, _) = fake.session().await;
+        let before = fake.requests().len();
+
+        let bad_name = request(
+            Identity::Thing("t".into()),
+            PolicyChoice::Existing("has space".into()),
+            dir.path(),
+        );
+        let outcome = session.provision_certificate(&bad_name).await;
+        assert_eq!(
+            outcome.error.unwrap().category,
+            ErrorCategory::Configuration
+        );
+
+        let bad_doc = request(
+            Identity::Thing("t".into()),
+            PolicyChoice::New {
+                name: "ok".into(),
+                document: "{".into(),
+            },
+            dir.path(),
+        );
+        let outcome = session.provision_certificate(&bad_doc).await;
+        assert!(outcome.error.unwrap().message.contains("Invalid JSON"));
+        assert!(outcome.completed.is_empty());
+        assert_eq!(
+            fake.requests().len(),
+            before,
+            "no AWS calls for invalid input"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_policy_failure_stops_before_a_certificate_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::Thing("t".into());
+        let fake = FakeAws::new().error(
+            "POST",
+            "/policies/dev-policy",
+            409,
+            "ResourceAlreadyExistsException",
+        );
+        let (session, _) = fake.session().await;
+        let outcome = session
+            .provision_certificate(&request(
+                identity.clone(),
+                new_policy(&identity),
+                dir.path(),
+            ))
+            .await;
+        let err = outcome.error.unwrap();
+        assert!(
+            err.message.contains("ResourceAlreadyExistsException"),
+            "{}",
+            err.message
+        );
+        assert!(outcome.saved.is_none());
+        assert!(fake.requests_to("POST", "/keys-and-certificate").is_empty());
+        assert!(
+            !err.details.unwrap_or_default().contains("not rolled back"),
+            "nothing was done, so there's nothing to list"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_failure_keeps_the_saved_key_and_lists_what_was_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::Thing("t".into());
+        let fake = FakeAws::new()
+            .json("POST", "/policies/dev-policy", json!({}))
+            .json("POST", "/keys-and-certificate", created_cert())
+            .json("PUT", "/target-policies/dev-policy", json!({}))
+            .error("PUT", "/things/t/principals", 403, "AccessDeniedException");
+        let (session, _) = fake.session().await;
+        let outcome = session
+            .provision_certificate(&request(
+                identity.clone(),
+                new_policy(&identity),
+                dir.path(),
+            ))
+            .await;
+        assert!(!outcome.is_success());
+        assert!(outcome.saved.as_ref().unwrap().key_path.is_file());
+        let err = outcome.error.unwrap();
+        let details = err.details.unwrap();
+        assert!(details.contains("not rolled back"), "{details}");
+        assert!(details.contains("Created policy dev-policy"), "{details}");
+        assert!(err.action.unwrap().contains("saved and loaded"));
+        assert_eq!(fake.requests_to("DELETE", "/policies/dev-policy").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_response_without_a_key_pair_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cert = created_cert();
+        cert.as_object_mut().unwrap().remove("keyPair");
+        let fake = FakeAws::new().json("POST", "/keys-and-certificate", cert);
+        let (session, _) = fake.session().await;
+        let outcome = session
+            .provision_certificate(&request(
+                Identity::ClientId("c".into()),
+                PolicyChoice::Existing("p".into()),
+                dir.path(),
+            ))
+            .await;
+        let err = outcome.error.unwrap();
+        assert!(
+            err.message.contains("missing the key pair"),
+            "{}",
+            err.message
+        );
+        assert!(outcome.saved.is_none());
     }
 }

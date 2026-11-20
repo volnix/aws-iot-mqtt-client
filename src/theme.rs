@@ -1,4 +1,4 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2026 Nick Volgas
 // SPDX-License-Identifier: Apache-2.0
 
 //! Glass theme: design tokens, egui style, the painted background, and the shared widgets the
@@ -649,13 +649,17 @@ pub fn link_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// A borderless icon button, for inline actions like refresh and unsubscribe.
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, hover: &str, enabled: bool) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(RichText::new(icon).small())
-            .frame(false)
-            .min_size(Vec2::splat(24.0)),
-    )
-    .on_hover_text(hover)
+    let response = ui
+        .add_enabled(
+            enabled,
+            egui::Button::new(RichText::new(icon).small())
+                .frame(false)
+                .min_size(Vec2::splat(24.0)),
+        )
+        .on_hover_text(hover);
+    // Screen readers announce the purpose, not the glyph.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, hover));
+    response
 }
 
 /// A segmented control, filling the available width.
@@ -746,10 +750,12 @@ pub fn disclosure(ui: &mut egui::Ui, open: &mut bool, label: &str) -> egui::Resp
         .horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
             paint_chevron(ui.painter(), rect, *open, p.muted);
-            ui.label(RichText::new(label).color(p.muted));
+            // Not selectable, so a click on the text toggles instead of starting a selection.
+            ui.add(egui::Label::new(RichText::new(label).color(p.muted)).selectable(false));
         })
         .response
         .interact(egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     if response.clicked() {
         *open = !*open;
     }
@@ -814,6 +820,10 @@ pub fn list_row(
             egui::Sense::hover()
         },
     );
+    let name = text.text().to_owned();
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::ListBoxOption, enabled, selected, &name)
+    });
     let fill = if selected {
         p.accent.gamma_multiply(0.18)
     } else if response.hovered() && enabled {

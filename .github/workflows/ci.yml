@@ -84,7 +84,10 @@ jobs:
             target
           key: coverage-${{ hashFiles('Cargo.lock') }}
       - name: Measure coverage
-        run: cargo llvm-cov --locked --lcov --output-path lcov.info
+        # Test-only helpers (the fake AWS endpoints and broker, the UI tests) aren't counted.
+        run: >-
+          cargo llvm-cov --locked --lcov --output-path lcov.info
+          --ignore-filename-regex '(test_support|ui_tests)\.rs$'
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:

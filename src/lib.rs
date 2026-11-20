@@ -1,4 +1,4 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2026 Nick Volgas
 // SPDX-License-Identifier: Apache-2.0
 
 //! AWS IoT MQTT Client: a cross-platform desktop MQTT 3.1.1/5 client for AWS IoT Core.
@@ -14,5 +14,7 @@ pub mod packet_log;
 pub mod paths;
 pub mod policy_sim;
 pub mod provision;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod theme;
 pub mod validators;

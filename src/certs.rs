@@ -1,4 +1,4 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2026 Nick Volgas
 // SPDX-License-Identifier: Apache-2.0
 
 //! Loading and validating the device's x.509 certificate and private key.

@@ -81,6 +81,18 @@ python3 scripts/generate_notice.py --check   # only fails if dependencies change
 - **Building a test app:** use `MqttApp::with_settings(&ctx, rt, settings)`. It installs fonts
   and theme and makes no AWS calls; the initial AWS load only runs in `App::ui`.
 - **New views:** when you add a view or tab, extend `app::tests::every_view_renders_without_panicking`.
+- **Tests never touch real AWS or the network:**
+  - AWS: build sessions with `test_support::FakeAws`, which routes by method and path to canned
+    JSON. Find an operation's path in the SDK's `schema_serde/shape_<op>_input_input.rs`.
+  - MQTT: use `test_support::broker::start`, a TLS broker on `127.0.0.1`.
+  - App: set `test_sdk_config` and `test_tls_roots`, and keep `started = true` so the real AWS
+    load never runs.
+- **UI tests (`src/app/ui_tests.rs`):**
+  - They use `egui_kittest` and find widgets by accessible label.
+  - Custom-painted widgets need `response.widget_info(..)` to be findable. `WidgetType` is now
+    `egui::Role`.
+  - Use `wait_until` for background results, never fixed sleeps.
+  - Keep clicked widgets inside the harness window (1400×1000). Off-screen clicks silently miss.
 - **MQTT protocol versions:** `src/mqtt.rs` has separate MQTT 3.1.1 (`rumqttc`) and MQTT 5
   (`rumqttc::v5`) drivers. Their `QoS`, `Packet`, and error types are distinct. Change both,
   and keep `unreachable_endpoint_reports_error` covering both.

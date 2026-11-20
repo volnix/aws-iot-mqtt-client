@@ -1,4 +1,4 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2026 Nick Volgas
 // SPDX-License-Identifier: Apache-2.0
 
 //! The "Policy simulator" tab: edit an IoT policy, pick an MQTT operation and connection
@@ -202,7 +202,7 @@ impl MqttApp {
         });
     }
 
-    fn sim_load_document(&mut self, ctx: &egui::Context, name: String) {
+    pub(super) fn sim_load_document(&mut self, ctx: &egui::Context, name: String) {
         let Some(session) = self.aws.session.clone() else {
             return;
         };

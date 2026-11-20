@@ -1,4 +1,4 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2026 Nick Volgas
 // SPDX-License-Identifier: Apache-2.0
 
 //! AWS account discovery: profiles, the IoT data endpoint, Things, and their certificates.
@@ -183,7 +183,16 @@ pub async fn open_session(
         loader = loader.region(Region::new(r.to_owned()));
     }
     let config = loader.load().await;
+    session_from_config(config, profile, log).await
+}
 
+/// Builds a [`Session`] from a loaded SDK config: checks the region, resolves credentials, and
+/// looks up the caller identity. Split from [`open_session`] so tests can supply the config.
+pub(crate) async fn session_from_config(
+    config: aws_config::SdkConfig,
+    profile: Option<&str>,
+    log: ApiLogSink,
+) -> Result<Session, AppError> {
     let region = config.region().map(|r| r.to_string()).ok_or_else(|| {
         AppError::configuration("No AWS region configured")
             .with_action("Choose a region, or set one on the selected profile / AWS_REGION.")
@@ -844,5 +853,513 @@ sso_start_url = https://example
         assert!(!ep.is_enabled());
         ep.status = None;
         assert!(ep.is_enabled());
+    }
+}
+
+/// `Session` calls against an in-process fake of the AWS endpoints (no network).
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::test_support::FakeAws;
+    use aws_credential_types::provider::SharedCredentialsProvider;
+    use aws_credential_types::provider::{error::CredentialsError, future};
+    use serde_json::json;
+
+    const ACCOUNT: &str = "123456789012";
+
+    fn arn() -> String {
+        format!("arn:aws:iam::{ACCOUNT}:role/Dev")
+    }
+
+    #[tokio::test]
+    async fn opens_session_and_reads_identity_without_logging_secrets() {
+        let fake = FakeAws::new().caller_identity(ACCOUNT, &arn());
+        let (session, log) = fake.session().await;
+        assert_eq!(session.region, "us-east-1");
+        assert_eq!(session.account(), Some(ACCOUNT));
+        assert_eq!(session.partition(), "aws");
+
+        let text = log.text();
+        assert!(text.contains("ResolveCredentials"), "{text}");
+        assert!(text.contains("long-term credentials"), "{text}");
+        assert!(text.contains("GetCallerIdentity OK"), "{text}");
+        let creds = aws_credential_types::Credentials::for_tests();
+        assert!(
+            !text.contains(creds.access_key_id()),
+            "access key logged: {text}"
+        );
+        assert!(
+            !text.contains(creds.secret_access_key()),
+            "secret logged: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_failure_is_not_fatal() {
+        let fake = FakeAws::new().error("POST", "/", 403, "AccessDenied");
+        let (session, log) = fake.session().await;
+        assert_eq!(session.identity, None);
+        assert_eq!(session.account(), None);
+        assert_eq!(session.partition(), "aws");
+        assert!(
+            log.text().contains("GetCallerIdentity ERROR"),
+            "{}",
+            log.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_comes_from_the_caller_arn() {
+        let fake = FakeAws::new().caller_identity(ACCOUNT, "arn:aws-cn:iam::123456789012:role/Dev");
+        let (session, _) = fake.session().await;
+        assert_eq!(session.partition(), "aws-cn");
+    }
+
+    #[tokio::test]
+    async fn temporary_credentials_log_their_expiry() {
+        let fake = FakeAws::new();
+        let expires = std::time::SystemTime::now() + Duration::from_secs(3600);
+        let creds = aws_credential_types::Credentials::new(
+            "ASIATESTKEY1234",
+            "not-a-real-secret",
+            Some("not-a-real-token".into()),
+            Some(expires),
+            "test",
+        );
+        let log = crate::test_support::LogCapture::default();
+        let config = fake.sdk_config_with(SharedCredentialsProvider::new(creds));
+        session_from_config(config, None, log.sink()).await.unwrap();
+        let text = log.text();
+        assert!(text.contains("temporary credentials, expire 20"), "{text}");
+        assert!(text.contains("profile=(default chain)"), "{text}");
+        assert!(text.contains("****1234"), "{text}");
+        assert!(!text.contains("not-a-real"), "{text}");
+    }
+
+    #[derive(Debug)]
+    struct FailingProvider;
+
+    impl ProvideCredentials for FailingProvider {
+        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            future::ProvideCredentials::ready(Err(CredentialsError::not_loaded("no profile")))
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolvable_credentials_are_a_credential_error() {
+        let fake = FakeAws::new();
+        let log = crate::test_support::LogCapture::default();
+        let config = fake.sdk_config_with(SharedCredentialsProvider::new(FailingProvider));
+        let err = session_from_config(config, Some("dev"), log.sink())
+            .await
+            .err()
+            .expect("credentials should fail");
+        assert_eq!(err.category, ErrorCategory::Credential);
+        assert!(err.action.unwrap().contains("aws sso login"));
+        assert!(
+            log.text().contains("ResolveCredentials ERROR"),
+            "{}",
+            log.text()
+        );
+        assert!(
+            fake.requests().is_empty(),
+            "no AWS call after a credential failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_region_is_a_configuration_error() {
+        let config = aws_config::SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let err = session_from_config(config, None, discard_log())
+            .await
+            .err()
+            .expect("no region");
+        assert_eq!(err.category, ErrorCategory::Configuration);
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_provider_is_a_credential_error() {
+        let config = aws_config::SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .build();
+        let err = session_from_config(config, None, discard_log())
+            .await
+            .err()
+            .expect("no provider");
+        assert_eq!(err.category, ErrorCategory::Credential);
+    }
+
+    fn domain(name: &str) -> serde_json::Value {
+        json!({ "domainConfigurationName": name, "serviceType": "DATA" })
+    }
+
+    fn described(name: &str, domain: &str, status: &str) -> serde_json::Value {
+        json!({
+            "domainConfigurationName": name,
+            "domainName": domain,
+            "domainConfigurationStatus": status,
+            "domainType": "CUSTOMER_MANAGED",
+        })
+    }
+
+    #[tokio::test]
+    async fn lists_default_and_custom_endpoints_across_pages() {
+        let fake = FakeAws::new()
+            .json(
+                "GET",
+                "/endpoint",
+                json!({ "endpointAddress": "abc-ats.iot.us-east-1.amazonaws.com" }),
+            )
+            .json_once(
+                "GET",
+                "/domainConfigurations",
+                json!({
+                    "domainConfigurations": [domain("zeta"), domain("iot:Data-ATS")],
+                    "nextMarker": "page-2",
+                }),
+            )
+            .json(
+                "GET",
+                "/domainConfigurations",
+                json!({ "domainConfigurations": [domain("Alpha"), domain("empty")] }),
+            )
+            .json(
+                "GET",
+                "/domainConfigurations/zeta",
+                described("zeta", "zeta.example.com", "DISABLED"),
+            )
+            .json(
+                "GET",
+                "/domainConfigurations/Alpha",
+                described("Alpha", "alpha.example.com", "ENABLED"),
+            )
+            .json(
+                "GET",
+                "/domainConfigurations/empty",
+                json!({ "domainConfigurationName": "empty" }),
+            );
+        let (session, log) = fake.session().await;
+        let found = session.list_data_endpoints().await.unwrap();
+        assert!(found.warning.is_none(), "{:?}", found.warning);
+
+        let labels: Vec<_> = found.endpoints.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, [DEFAULT_ENDPOINT_LABEL, "Alpha", "zeta"]);
+        assert!(found.endpoints[0].is_default);
+        assert!(found.endpoints[0].is_enabled());
+        assert_eq!(found.endpoints[1].domain_name, "alpha.example.com");
+        assert_eq!(
+            found.endpoints[1].domain_type.as_deref(),
+            Some("CUSTOMER_MANAGED")
+        );
+        assert!(!found.endpoints[2].is_enabled());
+
+        let pages = fake.requests_to("GET", "/domainConfigurations");
+        assert_eq!(pages.len(), 2);
+        assert!(
+            pages[0].query.contains("serviceType=DATA"),
+            "{}",
+            pages[0].query
+        );
+        assert!(
+            pages[1].query.contains("marker=page-2"),
+            "{}",
+            pages[1].query
+        );
+        assert!(
+            fake.requests_to("GET", "/domainConfigurations/iot%3AData-ATS")
+                .is_empty(),
+            "AWS-managed configurations are skipped"
+        );
+        assert!(log.text().contains("requestId=req-1234"), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn missing_domain_permissions_leave_the_default_with_a_warning() {
+        let fake = FakeAws::new()
+            .json(
+                "GET",
+                "/endpoint",
+                json!({ "endpointAddress": "abc-ats.iot.example" }),
+            )
+            .error("GET", "/domainConfigurations", 403, "AccessDeniedException");
+        let (session, _) = fake.session().await;
+        let found = session.list_data_endpoints().await.unwrap();
+        assert_eq!(found.endpoints.len(), 1);
+        let warning = found.warning.expect("warning");
+        assert_eq!(warning.category, ErrorCategory::Credential);
+        assert!(warning.details.unwrap().contains("AccessDeniedException"));
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_domain_is_reported_and_the_rest_listed() {
+        let fake = FakeAws::new()
+            .error("GET", "/endpoint", 401, "UnauthorizedException")
+            .json(
+                "GET",
+                "/domainConfigurations",
+                json!({ "domainConfigurations": [domain("good"), domain("bad")] }),
+            )
+            .json(
+                "GET",
+                "/domainConfigurations/good",
+                described("good", "good.example.com", "ENABLED"),
+            )
+            .error(
+                "GET",
+                "/domainConfigurations/bad",
+                403,
+                "AccessDeniedException",
+            );
+        let (session, _) = fake.session().await;
+        let found = session.list_data_endpoints().await.unwrap();
+        assert_eq!(found.endpoints.len(), 1);
+        assert_eq!(found.endpoints[0].label, "good");
+        let details = found.warning.unwrap().details.unwrap();
+        assert!(details.contains("DescribeEndpoint failed"), "{details}");
+        assert!(details.contains("bad: "), "{details}");
+    }
+
+    #[tokio::test]
+    async fn no_endpoints_at_all_is_an_error() {
+        let fake = FakeAws::new()
+            .error("GET", "/endpoint", 401, "UnauthorizedException")
+            .error("GET", "/domainConfigurations", 401, "UnauthorizedException");
+        let (session, _) = fake.session().await;
+        let err = session.list_data_endpoints().await.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Credential);
+        assert!(err.message.contains("DescribeEndpoint"), "{}", err.message);
+        assert!(err.action.unwrap().contains("iot:DescribeEndpoint"));
+    }
+
+    #[tokio::test]
+    async fn empty_default_address_with_no_domains_is_an_error() {
+        let fake = FakeAws::new()
+            .json("GET", "/endpoint", json!({ "endpointAddress": "" }))
+            .json(
+                "GET",
+                "/domainConfigurations",
+                json!({ "domainConfigurations": [] }),
+            );
+        let (session, _) = fake.session().await;
+        let err = session.list_data_endpoints().await.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Network);
+        assert!(
+            err.message.contains("No endpoint address"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_the_first_page_of_things_sorted() {
+        let fake = FakeAws::new().json(
+            "GET",
+            "/things",
+            json!({
+                "things": [
+                    { "thingName": "sensor-b", "thingTypeName": "Sensor", "thingArn": "arn:b" },
+                    { "thingName": "Sensor-a" },
+                    { "thingTypeName": "nameless" },
+                ],
+                "nextToken": "more",
+            }),
+        );
+        let (session, log) = fake.session().await;
+        let page = session.list_things_first_page().await.unwrap();
+        assert!(page.has_more);
+        let names: Vec<_> = page.things.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Sensor-a", "sensor-b"]);
+        assert_eq!(page.things[1].thing_type.as_deref(), Some("Sensor"));
+        assert!(fake.requests_to("GET", "/things")[0]
+            .query
+            .contains("maxResults=100"));
+        assert!(
+            log.text().contains("3 things (more available)"),
+            "{}",
+            log.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_page_of_things_has_no_more() {
+        let fake = FakeAws::new().json("GET", "/things", json!({ "things": [] }));
+        let (session, _) = fake.session().await;
+        let page = session.list_things_first_page().await.unwrap();
+        assert!(!page.has_more);
+        assert!(page.things.is_empty());
+    }
+
+    #[tokio::test]
+    async fn describes_a_typed_thing_name() {
+        let fake = FakeAws::new().json(
+            "GET",
+            "/things/my%20thing",
+            json!({ "thingName": "my thing", "thingArn": "arn:aws:iot:us-east-1:123456789012:thing/my thing" }),
+        );
+        let (session, _) = fake.session().await;
+        let thing = session.describe_thing("my thing").await.unwrap();
+        assert_eq!(thing.name, "my thing");
+        assert_eq!(thing.thing_type, None);
+        assert!(thing.arn.unwrap().ends_with("thing/my thing"));
+    }
+
+    #[tokio::test]
+    async fn unknown_thing_gets_a_friendly_error() {
+        let fake = FakeAws::new().error("GET", "/things/missing", 404, "ResourceNotFoundException");
+        let (session, _) = fake.session().await;
+        let err = session.describe_thing("missing").await.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Configuration);
+        assert!(
+            err.message
+                .contains("\"missing\" doesn't exist in us-east-1"),
+            "{}",
+            err.message
+        );
+        assert!(err.action.unwrap().contains("case-sensitive"));
+    }
+
+    #[tokio::test]
+    async fn other_describe_thing_errors_pass_through() {
+        let fake = FakeAws::new().error("GET", "/things/locked", 403, "AccessDeniedException");
+        let (session, _) = fake.session().await;
+        let err = session.describe_thing("locked").await.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Credential);
+        assert_eq!(err.message, "DescribeThing failed: AccessDeniedException");
+    }
+
+    #[tokio::test]
+    async fn reads_the_broker_view_of_a_connection() {
+        let fake = FakeAws::new().json(
+            "GET",
+            "/connections/device-1",
+            json!({
+                "clientId": "device-1",
+                "thingName": "device-1",
+                "connected": true,
+                "cleanSession": false,
+                "keepAliveDuration": 30,
+                "sessionExpiry": 3600,
+                "connectedSince": 1_700_000_000_000_i64,
+                "sourceIp": "203.0.113.5",
+                "sourcePort": 51234,
+                "targetIp": "198.51.100.7",
+                "vpcEndpointId": "vpce-1",
+            }),
+        );
+        let (session, _) = fake.session().await;
+        let info = session
+            .get_connection(Some("abc-ats.iot.example"), "device-1", true)
+            .await
+            .unwrap();
+        assert!(info.connected);
+        assert!(!info.clean_session);
+        assert_eq!(info.keep_alive_secs, 30);
+        assert_eq!(info.session_expiry_secs, 3600);
+        assert_eq!(
+            info.connected_since.unwrap().timestamp().as_millisecond(),
+            1_700_000_000_000
+        );
+        assert_eq!(info.disconnected_since, None, "0 means absent");
+        assert_eq!(info.source.as_deref(), Some("203.0.113.5:51234"));
+        assert_eq!(info.target.as_deref(), Some("198.51.100.7"));
+        assert_eq!(info.vpc_endpoint_id.as_deref(), Some("vpce-1"));
+        let req = &fake.requests_to("GET", "/connections/device-1")[0];
+        assert!(
+            req.query.contains("includeSocketInformation=true"),
+            "{}",
+            req.query
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_subscriptions_across_pages_sorted() {
+        let fake = FakeAws::new()
+            .json_once(
+                "GET",
+                "/connections/dev/subscriptions",
+                json!({
+                    "subscriptions": [{ "topicFilter": "z/#", "qos": 1 }],
+                    "nextToken": "t2",
+                }),
+            )
+            .json(
+                "GET",
+                "/connections/dev/subscriptions",
+                json!({ "subscriptions": [{ "topicFilter": "a/+", "qos": 0 }] }),
+            );
+        let (session, _) = fake.session().await;
+        let subs = session.list_subscriptions(None, "dev").await.unwrap();
+        assert_eq!(
+            subs,
+            [
+                SubscriptionInfo {
+                    topic_filter: "a/+".into(),
+                    qos: 0
+                },
+                SubscriptionInfo {
+                    topic_filter: "z/#".into(),
+                    qos: 1
+                },
+            ]
+        );
+        let pages = fake.requests_to("GET", "/connections/dev/subscriptions");
+        assert_eq!(pages.len(), 2);
+        assert!(
+            pages[1].query.contains("nextToken=t2"),
+            "{}",
+            pages[1].query
+        );
+    }
+
+    #[tokio::test]
+    async fn data_plane_errors_are_categorized() {
+        let fake = FakeAws::new().error(
+            "GET",
+            "/connections/dev/subscriptions",
+            403,
+            "ForbiddenException",
+        );
+        let (session, _) = fake.session().await;
+        let err = session.list_subscriptions(None, "dev").await.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Configuration);
+        assert_eq!(err.message, "ListSubscriptions failed: ForbiddenException");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn calls_time_out() {
+        let fake = FakeAws::new();
+        let (session, log) = fake.session().await;
+        let never = std::future::pending::<
+            Result<
+                aws_sdk_iot::operation::list_things::ListThingsOutput,
+                SdkError<aws_sdk_iot::operation::list_things::ListThingsError>,
+            >,
+        >();
+        let err = session
+            .call("ListThings", "", never, |_| String::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Network);
+        assert!(
+            err.message.contains("timed out after 10 seconds"),
+            "{}",
+            err.message
+        );
+        assert!(log.text().contains("ListThings TIMEOUT"), "{}", log.text());
+    }
+
+    #[test]
+    fn sdk_errors_without_a_code_are_categorized_by_message() {
+        let err: SdkError<aws_sdk_iot::operation::list_things::ListThingsError> =
+            SdkError::timeout_error("connection timed out");
+        let mapped = map_sdk_error("ListThings", err);
+        assert_eq!(mapped.message, "ListThings failed");
+        assert_ne!(mapped.category, ErrorCategory::Configuration);
     }
 }

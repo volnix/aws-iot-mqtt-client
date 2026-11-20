@@ -1,4 +1,4 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2026 Nick Volgas
 // SPDX-License-Identifier: Apache-2.0
 
 //! MQTT 3.1.1 or MQTT 5 connection to AWS IoT Core using mutual TLS (x.509 client certificate).
@@ -363,6 +363,18 @@ impl Connection {
     ) -> Result<Self, AppError> {
         config.validate()?;
         let tls = build_tls_config(&config.certificate_pem, &config.private_key_pem)?;
+        Ok(Self::start_with_tls(rt, id, config, tls, sink))
+    }
+
+    /// Starts connecting with a prepared TLS config. Split from [`Connection::start`] so tests
+    /// can trust a local test broker.
+    pub(crate) fn start_with_tls(
+        rt: &Handle,
+        id: u64,
+        config: ConnectionConfig,
+        tls: Arc<ClientConfig>,
+        sink: EventSink,
+    ) -> Self {
         let reporter = Reporter {
             id,
             sink,
@@ -390,14 +402,14 @@ impl Connection {
             }
         };
 
-        Ok(Self {
+        Self {
             id,
             version: config.version,
             client,
             task: Arc::new(Mutex::new(Some(task))),
             reporter,
             rt: rt.clone(),
-        })
+        }
     }
 
     /// Sends DISCONNECT and waits up to [`DISCONNECT_TIMEOUT`] before force-closing.
@@ -765,6 +777,15 @@ pub fn build_tls_config(
     certificate_pem: &[u8],
     private_key_pem: &[u8],
 ) -> Result<Arc<ClientConfig>, AppError> {
+    build_tls_config_with_roots(certificate_pem, private_key_pem, root_store())
+}
+
+/// [`build_tls_config`] with the given trust anchors (tests use a local CA).
+pub(crate) fn build_tls_config_with_roots(
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+    roots: RootCertStore,
+) -> Result<Arc<ClientConfig>, AppError> {
     let certs = CertificateDer::pem_slice_iter(certificate_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
@@ -783,7 +804,7 @@ pub fn build_tls_config(
     })?;
 
     let config = ClientConfig::builder()
-        .with_root_certificates(root_store())
+        .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)
         .map_err(|e| {
             AppError::authentication("The certificate and private key can't be used together")
@@ -1100,5 +1121,221 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// End-to-end tests against a minimal in-process MQTT broker over TLS on localhost. It speaks
+/// just enough MQTT 3.1.1 and 5 to drive both client event loops.
+#[cfg(test)]
+mod broker_tests {
+    use super::*;
+    use crate::test_support::broker::{self, Behavior};
+    use std::sync::mpsc::{channel, Receiver};
+
+    struct Session {
+        rt: tokio::runtime::Runtime,
+        conn: Connection,
+        events: Receiver<(u64, MqttEvent)>,
+        seen: Vec<MqttEvent>,
+    }
+
+    impl Session {
+        /// Waits for an event matching `want`, keeping every event seen for later checks.
+        fn wait_for(&mut self, what: &str, want: impl Fn(&MqttEvent) -> bool) -> MqttEvent {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let (id, ev) = self.events.recv_timeout(left).unwrap_or_else(|_| {
+                    panic!("timed out waiting for {what}; saw {:#?}", self.seen)
+                });
+                assert_eq!(id, 42);
+                self.seen.push(ev.clone());
+                if want(&ev) {
+                    return ev;
+                }
+            }
+        }
+
+        fn wait_state(&mut self, state: ConnectionState) -> Option<AppError> {
+            match self.wait_for(
+                state.label(),
+                |e| matches!(e, MqttEvent::State { state: s, .. } if *s == state),
+            ) {
+                MqttEvent::State { error, .. } => error,
+                _ => unreachable!(),
+            }
+        }
+
+        fn wait_packet(&mut self, direction: Direction, kind: &str) -> PacketLogEntry {
+            match self.wait_for(
+                kind,
+                |e| matches!(e, MqttEvent::Packet(p) if p.direction == direction && p.kind == kind),
+            ) {
+                MqttEvent::Packet(p) => p,
+                _ => unreachable!(),
+            }
+        }
+
+        fn wait_message(&mut self) -> ReceivedMessage {
+            match self.wait_for("a message", |e| matches!(e, MqttEvent::Message(_))) {
+                MqttEvent::Message(m) => m,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn connect(version: MqttVersion, behavior: Behavior) -> Session {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (port, roots) = broker::start(&rt, behavior);
+
+        let ck = rcgen::generate_simple_self_signed(vec!["device".into()]).unwrap();
+        let (cert, key) = (
+            ck.cert.pem().into_bytes(),
+            ck.signing_key.serialize_pem().into_bytes(),
+        );
+        let tls = build_tls_config_with_roots(&cert, &key, roots).unwrap();
+        let config = ConnectionConfig {
+            endpoint: "localhost".into(),
+            port,
+            client_id: "device-1".into(),
+            certificate_pem: cert,
+            private_key_pem: key,
+            version,
+            clean_session: true,
+            session_expiry_secs: (version == MqttVersion::V5).then_some(60),
+            last_will: Some(LastWill {
+                topic: "status/device-1".into(),
+                payload: b"offline".to_vec(),
+                qos: 1,
+                retain: false,
+            }),
+        };
+        let (tx, events) = channel();
+        let sink: EventSink = Arc::new(move |id, ev| {
+            let _ = tx.send((id, ev));
+        });
+        let conn = Connection::start_with_tls(rt.handle(), 42, config, tls, sink);
+        Session {
+            rt,
+            conn,
+            events,
+            seen: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn publish_subscribe_and_disconnect_on_both_versions() {
+        for version in [MqttVersion::V5, MqttVersion::V311] {
+            let mut s = connect(version, Behavior::Accept);
+            assert_eq!(s.conn.version, version);
+            s.wait_state(ConnectionState::Connecting);
+            let connect = s.wait_packet(Direction::Sent, "CONNECT");
+            assert!(
+                connect.details.contains("client_id=device-1"),
+                "{}",
+                connect.details
+            );
+            s.wait_packet(Direction::Received, "CONNACK");
+            s.wait_state(ConnectionState::Connected);
+
+            s.conn.subscribe("sensors/#", 1).unwrap();
+            let sub = s.wait_packet(Direction::Sent, "SUBSCRIBE");
+            assert!(
+                sub.details.contains("filter=sensors/# qos=1"),
+                "{}",
+                sub.details
+            );
+            s.wait_packet(Direction::Received, "SUBACK");
+
+            s.conn
+                .publish("sensors/1", 1, false, b"{\"t\":21}".to_vec())
+                .unwrap();
+            let sent = s.wait_packet(Direction::Sent, "PUBLISH");
+            assert!(
+                sent.details.contains("topic=sensors/1 qos=1"),
+                "{}",
+                sent.details
+            );
+            s.wait_packet(Direction::Received, "PUBACK");
+            let msg = s.wait_message();
+            assert_eq!(msg.topic, "sensors/1");
+            assert_eq!(msg.payload, b"{\"t\":21}");
+            assert_eq!(msg.qos, 1);
+            s.wait_packet(Direction::Sent, "PUBACK");
+
+            s.conn
+                .publish("sensors/2", 0, true, b"zero".to_vec())
+                .unwrap();
+            assert_eq!(s.wait_message().payload, b"zero");
+
+            s.conn
+                .publish("sensors/3", 2, false, b"two".to_vec())
+                .unwrap();
+            s.wait_packet(Direction::Received, "PUBREC");
+            s.wait_packet(Direction::Sent, "PUBREL");
+            s.wait_packet(Direction::Received, "PUBCOMP");
+
+            let err = s.conn.publish("sensors/+", 0, false, vec![]).unwrap_err();
+            assert_eq!(err.category, ErrorCategory::Configuration);
+            assert!(s.conn.subscribe("", 0).is_err());
+
+            s.conn.unsubscribe("sensors/#").unwrap();
+            let unsub = s.wait_packet(Direction::Sent, "UNSUBSCRIBE");
+            assert!(
+                unsub.details.contains("filter=sensors/#"),
+                "{}",
+                unsub.details
+            );
+            s.wait_packet(Direction::Received, "UNSUBACK");
+
+            s.conn.disconnect();
+            s.conn.disconnect(); // a second call is a no-op
+            s.wait_state(ConnectionState::Disconnecting);
+            s.wait_packet(Direction::Sent, "DISCONNECT");
+            assert!(s.wait_state(ConnectionState::Disconnected).is_none());
+            drop(s.rt);
+        }
+    }
+
+    #[test]
+    fn refused_connection_is_an_authentication_error() {
+        for version in [MqttVersion::V5, MqttVersion::V311] {
+            let mut s = connect(version, Behavior::Refuse);
+            let err = s.wait_state(ConnectionState::Error).expect("error");
+            assert_eq!(
+                err.category,
+                ErrorCategory::Authentication,
+                "{version:?}: {err:?}"
+            );
+            assert!(err.message.contains("refused"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn broker_ending_the_session_is_reported() {
+        let mut s = connect(MqttVersion::V5, Behavior::KickAfterConnect);
+        s.wait_state(ConnectionState::Connected);
+        let err = s.wait_state(ConnectionState::Error).expect("error");
+        assert!(
+            err.message.contains("Broker closed the connection"),
+            "{}",
+            err.message
+        );
+        assert!(err.action.unwrap().contains("iot:Connect"));
+
+        let mut s = connect(MqttVersion::V311, Behavior::KickAfterConnect);
+        s.wait_state(ConnectionState::Connected);
+        let err = s.wait_state(ConnectionState::Error).expect("error");
+        assert_eq!(err.message, "Connection lost");
+    }
+
+    #[test]
+    fn requests_after_the_loop_ends_fail_to_queue_or_are_dropped() {
+        let mut s = connect(MqttVersion::V311, Behavior::Refuse);
+        s.wait_state(ConnectionState::Error);
+        // The event loop is gone; queuing may still succeed (bounded channel) but must not panic.
+        let _ = s.conn.publish("a/b", 0, false, vec![]);
+        s.conn.disconnect();
+        s.wait_state(ConnectionState::Disconnecting);
     }
 }

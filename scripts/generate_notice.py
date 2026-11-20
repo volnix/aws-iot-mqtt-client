@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2026 Nick Volgas
 # SPDX-License-Identifier: Apache-2.0
 """Regenerates NOTICE from `cargo metadata`.
 
@@ -19,7 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 NOTICE = ROOT / "NOTICE"
 
 HEADER = """AWS IoT MQTT Client
-Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+Copyright 2026 Nick Volgas
 
 **********************
 THIRD PARTY COMPONENTS
