@@ -28,9 +28,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 rustls-pemfile = "2.2"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 webpki-roots = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 x509-parser = "0.18"
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
