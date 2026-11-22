@@ -46,6 +46,28 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `topic` matches the MQTT topic filter `filter` (`+` matches one level, a trailing
+/// `#` matches the rest, including the parent level).
+pub fn topic_matches(filter: &str, topic: &str) -> bool {
+    let mut levels = topic.split('/');
+    for part in filter.split('/') {
+        match part {
+            "#" => return true,
+            "+" => {
+                if levels.next().is_none() {
+                    return false;
+                }
+            }
+            literal => {
+                if levels.next() != Some(literal) {
+                    return false;
+                }
+            }
+        }
+    }
+    levels.next().is_none()
+}
+
 /// Topic name for PUBLISH: non-empty, at most 256 bytes, no wildcards.
 pub fn validate_publish_topic(topic: &str) -> Result<(), String> {
     check_topic_common(topic)?;
@@ -86,6 +108,23 @@ fn check_topic_common(topic: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topic_filters_match_per_mqtt_rules() {
+        assert!(topic_matches("a/b", "a/b"));
+        assert!(!topic_matches("a/b", "a/b/c"));
+        assert!(topic_matches("a/+", "a/b"));
+        assert!(!topic_matches("a/+", "a/b/c"));
+        assert!(topic_matches("a/#", "a/b/c"));
+        assert!(topic_matches("a/#", "a"));
+        assert!(topic_matches("#", "x/y"));
+        assert!(topic_matches("+/+/c", "a/b/c"));
+        assert!(!topic_matches("a/b/c", "a/b"));
+        assert!(topic_matches(
+            "$aws/things/t/shadow/#",
+            "$aws/things/t/shadow/get/accepted"
+        ));
+    }
     use proptest::prelude::*;
 
     #[test]

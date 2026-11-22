@@ -30,9 +30,11 @@ use crate::provision::{
     self, ArnScope, Identity, PolicyChoice, ProvisionOutcome, ProvisionRequest,
 };
 use crate::theme::{self, Palette, Severity, ThemeWatcher};
-use crate::validators::validate_client_id;
+use crate::validators::{topic_matches, validate_client_id};
 
+mod shadows;
 mod simulator;
+use shadows::ShadowState;
 use simulator::{SimSettings, SimState};
 
 const MAX_MESSAGES: usize = 500;
@@ -44,6 +46,7 @@ const MESSAGE_PAYLOAD_MAX: usize = 8 * 1024;
 enum View {
     #[default]
     Client,
+    Shadows,
     Simulator,
 }
 
@@ -221,6 +224,11 @@ enum AppMsg {
         name: String,
         result: Result<String, AppError>,
     },
+    /// `ListNamedShadowsForThing` for the Thing a connection is using.
+    NamedShadows {
+        connection_id: u64,
+        result: Result<Vec<String>, AppError>,
+    },
 }
 
 #[derive(Default)]
@@ -349,6 +357,7 @@ pub struct MqttApp {
     theme_watcher: Option<ThemeWatcher>,
     sim: SimState,
     live: LiveState,
+    shadow: ShadowState,
 
     provision: Option<ProvisionDialog>,
     notice: Option<String>,
@@ -410,6 +419,7 @@ impl MqttApp {
             theme_watcher: ThemeWatcher::for_build(),
             sim: SimState::default(),
             live: LiveState::default(),
+            shadow: ShadowState::default(),
             provision: None,
             notice: None,
             #[cfg(test)]
@@ -726,6 +736,10 @@ impl MqttApp {
                 } => self.apply_provision_outcome(identity, policy, outcome),
                 AppMsg::SimPolicies { result } => self.apply_sim_policies(result),
                 AppMsg::SimPolicyDocument { name, result } => self.apply_sim_document(name, result),
+                AppMsg::NamedShadows {
+                    connection_id,
+                    result,
+                } => self.apply_named_shadows(connection_id, result),
                 _ => {} // Stale result from a superseded request.
             }
         }
@@ -839,6 +853,7 @@ impl MqttApp {
                     // Give the broker a moment to register the session before asking about it.
                     self.fetch_live_connection(ctx, Duration::from_secs(1));
                     self.fetch_live_subscriptions(ctx, Duration::from_secs(1));
+                    self.start_shadows(ctx);
                 }
                 if matches!(
                     state,
@@ -853,12 +868,26 @@ impl MqttApp {
             MqttEvent::Packet(entry) => {
                 let changed_subscriptions = entry.direction == Direction::Received
                     && (entry.kind == "SUBACK" || entry.kind == "UNSUBACK");
+                if entry.direction == Direction::Received && entry.kind == "SUBACK" {
+                    self.shadow_suback(&entry.details);
+                }
                 self.log.push(entry);
                 if changed_subscriptions {
                     self.fetch_live_subscriptions(ctx, Duration::from_secs(1));
                 }
             }
             MqttEvent::Message(m) => {
+                // Shadow traffic goes to the Shadows tab; it's shown here too only if one of
+                // the user's own subscriptions covers it.
+                let shadow_topic = self.shadow_message(&m.topic, &m.payload);
+                if shadow_topic
+                    && !self
+                        .subscriptions
+                        .iter()
+                        .any(|f| topic_matches(f, &m.topic))
+                {
+                    return;
+                }
                 if self.messages.len() == MAX_MESSAGES {
                     self.messages.pop_back();
                 }
@@ -953,8 +982,9 @@ impl MqttApp {
             ui.label(theme::title("AWS IoT MQTT"));
             ui.add_space(6.0);
             for (view, label) in [
-                (View::Client, "Client"),
-                (View::Simulator, "Policy simulator"),
+                (View::Client, "Client".to_owned()),
+                (View::Shadows, self.shadows_tab_label()),
+                (View::Simulator, "Policy simulator".to_owned()),
             ] {
                 if theme::tab(ui, self.settings.view == view, label).clicked() {
                     self.settings.view = view;
@@ -2307,6 +2337,7 @@ impl MqttApp {
             self.load_from_aws(&ctx);
         }
         self.drain_messages(&ctx);
+        self.expire_shadow_requests();
         theme::paint_background(&ctx);
         self.provision_dialog(&ctx);
 
@@ -2351,6 +2382,12 @@ impl MqttApp {
             egui::CentralPanel::no_frame()
                 .frame(egui::Frame::new().inner_margin(Margin::same(g)))
                 .show(ui, |ui| self.simulator_view(ui));
+            return;
+        }
+        if self.settings.view == View::Shadows {
+            egui::CentralPanel::no_frame()
+                .frame(egui::Frame::new().inner_margin(Margin::same(g)))
+                .show(ui, |ui| self.shadows_view(ui));
             return;
         }
 
@@ -2674,6 +2711,7 @@ mod tests {
                 let mut out = ctx.run_ui(Default::default(), |ui| {
                     theme::paint_background(ui.ctx());
                     app.top_bar(ui);
+                    app.shadows_view(ui);
                     app.simulator_view(ui);
                     app.sidebar(ui);
                     app.main_column(ui);

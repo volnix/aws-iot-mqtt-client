@@ -34,6 +34,12 @@ macOS, Windows, and Linux.
 - While connected, see the broker's view of your connection: connection time, session
   settings, and every active subscription, each with an unsubscribe button.
 
+**Work with Device Shadows**
+
+- When you connect as a Thing, its classic and named shadows load automatically.
+- The **Shadows** tab shows each shadow's desired, reported, and delta state, with its version.
+- Update the desired or reported state, or create a new named shadow, as the device would.
+
 **Create certificates in one step**
 
 - Create a certificate and key for a Thing or client ID without leaving the app.
@@ -60,15 +66,15 @@ Download the latest build for your system from the
 
 | System | File |
 | --- | --- |
-| macOS (Apple silicon and Intel) | `aws-iot-mqtt-client-<version>-macos-universal.zip` |
+| macOS (Apple silicon and Intel) | `aws-iot-mqtt-client-<version>-macos-universal.dmg` (or `.zip`) |
 | Windows | `aws-iot-mqtt-client-<version>-windows-x86_64.zip` |
 | Linux (Intel/AMD) | `aws-iot-mqtt-client-<version>-linux-x86_64.tar.gz` |
 | Linux (ARM) | `aws-iot-mqtt-client-<version>-linux-arm64.tar.gz` |
 
-The builds aren't code-signed yet, so the first launch needs one extra step:
-
-- **macOS:** unzip, move **AWS IoT MQTT Client** to Applications, then right-click it and choose
-  **Open** (once). Or run `xattr -dr com.apple.quarantine "/Applications/AWS IoT MQTT Client.app"`.
+- **macOS:** open the `.dmg` and drag **AWS IoT MQTT Client** to **Applications**. Releases are
+  signed with a Developer ID and notarized by Apple, so it opens like any other app. If macOS
+  says it can't verify the app (older, unsigned builds), open **System Settings → Privacy &
+  Security** and click **Open Anyway**.
 - **Windows:** unzip and run `aws-iot-mqtt-client.exe`. If SmartScreen appears, choose
   **More info → Run anyway**.
 - **Linux:** extract and run `./aws-iot-mqtt-client`. It needs a desktop session (X11 or
@@ -103,11 +109,14 @@ To browse your account and connect (read-only):
 ```
 iot:DescribeEndpoint, iot:ListThings, iot:DescribeThing,
 iot:ListDomainConfigurations, iot:DescribeDomainConfiguration,
-iot:GetConnection, iot:ListSubscriptions
+iot:GetConnection, iot:ListSubscriptions, iot:ListNamedShadowsForThing
 ```
 
 Without the domain configuration permissions, only the default endpoint is listed.
-`iot:GetConnection` and `iot:ListSubscriptions` are only used while connected.
+`iot:GetConnection`, `iot:ListSubscriptions`, and `iot:ListNamedShadowsForThing` are only used
+while connected. Shadow reads and updates go over MQTT as the device, so they need the
+device's policy to allow its `$aws/things/<thing>/shadow/` topics. The app's default policy
+allows them.
 
 To create certificates, and to load policies into the simulator:
 

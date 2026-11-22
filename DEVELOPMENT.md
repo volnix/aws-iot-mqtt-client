@@ -46,7 +46,7 @@ python3 scripts/package.py                    # macOS, Linux, or Windows (use `p
 python3 scripts/package.py --macos-universal  # macOS: one app for Apple silicon and Intel
 ```
 
-The archive and its `.sha256` file go to `dist/`. On macOS it's a zipped `.app`. A universal
+The archive and its `.sha256` file go to `dist/`. On macOS you get a `.dmg` and a zipped `.app`. A universal
 build needs both targets: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
 
 ## Develop with hot reload
@@ -130,8 +130,10 @@ pitfalls.
 | --- | --- |
 | `src/app.rs` | egui UI; background work runs on a tokio runtime and reports back over a channel |
 | `src/app/simulator.rs` | The Policy simulator tab |
+| `src/app/shadows.rs` | The Shadows tab: loads the connected Thing's shadows and sends updates |
+| `src/shadow.rs` | Device Shadow topics, payloads, response handling, and delta (no UI or network) |
 | `src/policy_sim.rs` | Offline policy evaluation for MQTT operations (no UI or AWS dependencies) |
-| `src/aws.rs` | Profile discovery, credential resolution, logged IoT/STS/data-plane calls, endpoint discovery |
+| `src/aws.rs` | Profile discovery, credential resolution, logged IoT/STS/data-plane calls (including listing named shadows), endpoint discovery |
 | `src/provision.rs` | Certificate creation workflow, default policy template, local credential storage |
 | `src/mqtt.rs` | MQTT 3.1.1 and 5 connections over mTLS (rumqttc + rustls), state machine, packet descriptions |
 | `src/certs.rs` | PEM certificate/key parsing, certificate ID (SHA-256 of DER) |
@@ -171,6 +173,43 @@ Notes:
   workflow**. The archives are attached to that run as artifacts.
 - **Re-running:** if publishing fails partway, delete the release and the tag on GitHub, fix the
   problem, and push the tag again.
-- **Code signing:** builds aren't signed yet. macOS signing and notarization need an Apple
-  Developer ID, and Windows signing needs a code-signing certificate. Both can be added to the
-  workflow later as repository secrets.
+- **Windows signing:** Windows builds aren't signed, so SmartScreen may warn on first launch.
+  Signing them needs a code-signing certificate.
+
+### macOS signing and notarization
+
+When the secrets below exist, the release workflow signs the macOS app and disk image with a
+Developer ID and has Apple notarize them, so they open without Gatekeeper warnings. Without the
+secrets, releases still build with an ad-hoc signature. This is for distribution outside the
+Mac App Store; nothing is submitted to the store.
+
+1. **Developer ID certificate:** in Xcode, open **Settings → Accounts → Manage Certificates →
+   + → Developer ID Application**. Only the team's Account Holder can create one.
+   - If Xcode reports "Communication with Apple failed", accept any pending agreement at
+     [developer.apple.com/account](https://developer.apple.com/account), and check that the
+     team selected in Xcode is the one where you're Account Holder.
+   - Alternatively, create it at
+     [Certificates](https://developer.apple.com/account/resources/certificates/list) with a
+     certificate signing request from Keychain Access.
+2. **Export it:** in Keychain Access, under **My Certificates**, export the certificate
+   (including its private key) as a `.p12` with a password.
+3. **Notarization key:** in App Store Connect, open **Users and Access → Integrations → App
+   Store Connect API → Team Keys**, generate a key with the **Developer** role, and download
+   the `.p8` file. Apple lets you download it only once.
+4. **Repository secrets:** add these under **Settings → Secrets and variables → Actions**:
+
+   | Secret | Value |
+   | --- | --- |
+   | `MACOS_CERTIFICATE_P12` | `base64 -i certificate.p12` |
+   | `MACOS_CERTIFICATE_PASSWORD` | the `.p12` password |
+   | `MACOS_SIGNING_IDENTITY` | the name from `security find-identity -v -p codesigning`, e.g. `Developer ID Application: Your Name (TEAMID)` |
+   | `NOTARY_KEY_P8` | `base64 -i AuthKey_XXXXXXXXXX.p8` |
+   | `NOTARY_KEY_ID` | the key's ID |
+   | `NOTARY_ISSUER_ID` | the issuer ID shown above the keys |
+
+To check a release, download the disk image, open it, and run
+`spctl --assess --type execute -vv "/Volumes/AWS IoT MQTT Client/AWS IoT MQTT Client.app"`.
+It should report `source=Notarized Developer ID`.
+
+To sign locally, set `MACOS_SIGNING_IDENTITY`, and optionally `NOTARY_KEY_PATH`,
+`NOTARY_KEY_ID`, and `NOTARY_ISSUER_ID`, before running `scripts/package.py`.

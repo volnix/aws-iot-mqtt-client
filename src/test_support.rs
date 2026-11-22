@@ -229,11 +229,111 @@ pub mod broker {
     /// Starts a broker that serves one client, and returns its port and the roots that
     /// trust its certificate (for `localhost`).
     pub fn start(rt: &tokio::runtime::Runtime, behavior: Behavior) -> (u16, RootCertStore) {
+        start_with_shadows(rt, behavior, Vec::new())
+    }
+
+    /// Like [`start`], with Device Shadows the broker answers for, as
+    /// `(topic prefix, state)` pairs such as `("$aws/things/t/shadow", {"desired": {..}})`.
+    /// Shadow `get` and `update` requests are answered like the Device Shadow service.
+    pub fn start_with_shadows(
+        rt: &tokio::runtime::Runtime,
+        behavior: Behavior,
+        shadows: Vec<(String, serde_json::Value)>,
+    ) -> (u16, RootCertStore) {
         let ca = test_ca();
         let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let port = listener.local_addr().unwrap().port();
-        rt.spawn(serve(listener, ca.server, behavior));
+        let shadows = shadows
+            .into_iter()
+            .map(|(prefix, state)| (prefix, (state, 1u64)))
+            .collect();
+        rt.spawn(serve(listener, ca.server, behavior, shadows));
         (port, ca.roots)
+    }
+
+    type ShadowStore = std::collections::HashMap<String, (serde_json::Value, u64)>;
+
+    /// A broker-to-client PUBLISH at QoS 1 (packet ID 1).
+    fn publish_packet(topic: &str, payload: &[u8], v5: bool) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        b.extend_from_slice(topic.as_bytes());
+        b.extend_from_slice(&[0x00, 0x01]);
+        if v5 {
+            b.push(0x00);
+        }
+        b.extend_from_slice(payload);
+        packet(0x32, &b)
+    }
+
+    /// Answers a shadow `get` or `update` like the Device Shadow service, or returns `None`
+    /// for any other topic.
+    fn shadow_reply(
+        store: &mut ShadowStore,
+        topic: &str,
+        payload: &[u8],
+        v5: bool,
+    ) -> Option<Vec<u8>> {
+        use serde_json::{json, Value};
+        if !topic.starts_with("$aws/things/") || !topic.contains("/shadow") {
+            return None;
+        }
+        let (prefix, op) = topic.rsplit_once('/')?;
+        match op {
+            "get" => Some(match store.get(prefix) {
+                Some((state, version)) => {
+                    let mut state = state.clone();
+                    if let Some(delta) =
+                        crate::shadow::delta(state.get("desired"), state.get("reported"))
+                    {
+                        state["delta"] = delta;
+                    }
+                    let doc =
+                        json!({ "state": state, "version": version, "timestamp": 1_700_000_000 });
+                    publish_packet(
+                        &format!("{prefix}/get/accepted"),
+                        doc.to_string().as_bytes(),
+                        v5,
+                    )
+                }
+                None => {
+                    let err = json!({ "code": 404, "message": "No shadow exists with name" });
+                    publish_packet(
+                        &format!("{prefix}/get/rejected"),
+                        err.to_string().as_bytes(),
+                        v5,
+                    )
+                }
+            }),
+            "update" => {
+                let request: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+                let Some(update) = request.get("state").and_then(Value::as_object) else {
+                    let err = json!({ "code": 400, "message": "Missing required node: state" });
+                    return Some(publish_packet(
+                        &format!("{prefix}/update/rejected"),
+                        err.to_string().as_bytes(),
+                        v5,
+                    ));
+                };
+                let entry = store.entry(prefix.to_owned()).or_insert((json!({}), 0));
+                for (section, value) in update {
+                    if value.is_null() {
+                        entry.0.as_object_mut().unwrap().remove(section);
+                    } else {
+                        entry.0[section] = value.clone();
+                    }
+                }
+                entry.1 += 1;
+                let accepted =
+                    json!({ "state": update, "version": entry.1, "timestamp": 1_700_000_100 });
+                Some(publish_packet(
+                    &format!("{prefix}/update/accepted"),
+                    accepted.to_string().as_bytes(),
+                    v5,
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// How the broker answers a CONNECT.
@@ -329,7 +429,12 @@ pub mod broker {
     }
 
     /// Accepts one client and serves it until it disconnects.
-    async fn serve(listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor, behavior: Behavior) {
+    async fn serve(
+        listener: TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+        behavior: Behavior,
+        mut shadows: ShadowStore,
+    ) {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut s = acceptor.accept(tcp).await.unwrap();
         let mut v5 = false;
@@ -383,15 +488,11 @@ pub mod broker {
                         (2, Some(id)) => packet(0x50, &id),
                         _ => Vec::new(),
                     };
-                    let mut echo = Vec::new();
-                    echo.extend_from_slice(&(topic_len as u16).to_be_bytes());
-                    echo.extend_from_slice(topic);
-                    echo.extend_from_slice(&[0x00, 0x01]);
-                    if v5 {
-                        echo.push(0x00);
+                    let topic = String::from_utf8_lossy(topic).into_owned();
+                    match shadow_reply(&mut shadows, &topic, payload, v5) {
+                        Some(reply) => out.extend(reply),
+                        None => out.extend(publish_packet(&topic, payload, v5)),
                     }
-                    echo.extend_from_slice(payload);
-                    out.extend(packet(0x32, &echo));
                     out
                 }
                 6 => packet(0x70, &pkid(0)), // PUBREL → PUBCOMP

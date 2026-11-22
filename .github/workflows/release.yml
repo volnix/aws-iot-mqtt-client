@@ -70,9 +70,51 @@ jobs:
         shell: bash
         run: echo "EXPECT=--expect-version ${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
+      # Compiles with no secrets in the environment: dependency build scripts run here.
       - name: Build and package
         shell: bash
         run: python scripts/package.py ${{ matrix.args }} $EXPECT
+
+      # macOS only, and only once the signing secrets exist (see DEVELOPMENT.md). Re-packages
+      # the binaries built above without compiling anything, so the secrets are only ever
+      # visible to codesign and Apple's notary tool.
+      - name: Sign and notarize (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          if [[ -z "$MACOS_CERTIFICATE_P12" ]]; then
+            echo "No signing secrets; keeping the ad-hoc signed build."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -f pkcs12 \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+
+          if [[ -n "$NOTARY_KEY_P8" ]]; then
+            printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary_key.p8"
+            export NOTARY_KEY_PATH="$RUNNER_TEMP/notary_key.p8"
+          else
+            unset NOTARY_KEY_ID NOTARY_ISSUER_ID
+          fi
+          rm -f dist/*
+          python scripts/package.py ${{ matrix.args }} --skip-build $EXPECT
+          rm -f "$RUNNER_TEMP/notary_key.p8"
+          security delete-keychain "$keychain"
 
       - uses: actions/upload-artifact@v7
         with:

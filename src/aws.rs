@@ -723,6 +723,48 @@ impl Session {
     }
 }
 
+impl Session {
+    /// `ListNamedShadowsForThing` (IoT data plane, read-only): the names of a Thing's named
+    /// shadows, sorted. The classic shadow isn't listed; check for it with a shadow `get`.
+    pub async fn list_named_shadows(
+        &self,
+        data_endpoint: Option<&str>,
+        thing_name: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let client = self.data_client(data_endpoint);
+        let mut names = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let out = self
+                .call(
+                    "ListNamedShadowsForThing",
+                    format!(
+                        "thingName={thing_name} pageSize=100{}",
+                        token.as_ref().map(|_| " nextToken=…").unwrap_or("")
+                    ),
+                    client
+                        .list_named_shadows_for_thing()
+                        .thing_name(thing_name)
+                        .page_size(100)
+                        .set_next_token(token.take())
+                        .send(),
+                    |o| format!("{} named shadows", o.results().len()),
+                )
+                .await?;
+            names.extend(out.results().iter().cloned());
+            token = out
+                .next_token()
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned);
+            if token.is_none() {
+                break;
+            }
+        }
+        names.sort_by_key(|n| n.to_lowercase());
+        Ok(names)
+    }
+}
+
 fn socket(ip: Option<&str>, port: i32) -> Option<String> {
     let ip = ip.filter(|i| !i.is_empty())?;
     Some(if port > 0 {
@@ -1315,6 +1357,29 @@ mod session_tests {
             "{}",
             pages[1].query
         );
+    }
+
+    #[tokio::test]
+    async fn lists_named_shadows_across_pages_sorted() {
+        let path = "/api/things/shadow/ListNamedShadowsForThing/sensor-1";
+        let fake = FakeAws::new()
+            .json_once(
+                "GET",
+                path,
+                json!({ "results": ["zeta"], "nextToken": "n2" }),
+            )
+            .json("GET", path, json!({ "results": ["Alpha"], "timestamp": 1 }));
+        let (session, log) = fake.session().await;
+        let names = session.list_named_shadows(None, "sensor-1").await.unwrap();
+        assert_eq!(names, ["Alpha", "zeta"]);
+        let pages = fake.requests_to("GET", path);
+        assert_eq!(pages.len(), 2);
+        assert!(
+            pages[1].query.contains("nextToken=n2"),
+            "{}",
+            pages[1].query
+        );
+        assert!(log.text().contains("1 named shadows"), "{}", log.text());
     }
 
     #[tokio::test]

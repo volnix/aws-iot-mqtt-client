@@ -14,6 +14,7 @@ pub mod packet_log;
 pub mod paths;
 pub mod policy_sim;
 pub mod provision;
+pub mod shadow;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod theme;

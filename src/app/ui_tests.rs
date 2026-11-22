@@ -13,6 +13,7 @@ use egui_kittest::Harness;
 use serde_json::json;
 
 use super::*;
+use crate::shadow;
 use crate::test_support::{broker, FakeAws};
 
 const ACCOUNT: &str = "123456789012";
@@ -534,4 +535,191 @@ fn simulator_tab_loads_policies_and_evaluates() {
     }
     click(&mut h, "Reset to example");
     assert!(!h.state().settings.sim.policy.contains("iot:*"));
+}
+
+/// Connecting as a Thing finds its classic and named shadows; the Shadows tab shows their state
+/// and updates them over MQTT. Shadow traffic stays out of the Messages panel.
+#[test]
+fn shadows_tab_lists_shows_and_updates_shadows() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (port, roots) = broker::start_with_shadows(
+        &rt,
+        broker::Behavior::Accept,
+        vec![
+            (
+                "$aws/things/sensor-1/shadow".into(),
+                json!({ "desired": { "led": "on" }, "reported": { "led": "off" } }),
+            ),
+            (
+                "$aws/things/sensor-1/shadow/name/config".into(),
+                json!({ "reported": { "fw": "1.0" } }),
+            ),
+        ],
+    );
+    let fake = account_fake().json(
+        "GET",
+        "/api/things/shadow/ListNamedShadowsForThing/sensor-1",
+        json!({ "results": ["config"], "timestamp": 1 }),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["sensor-1".into()]).unwrap();
+    let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+
+    let mut app = test_app(rt, &fake, roots, port);
+    app.load_certificate(&cert);
+    app.load_private_key(&key);
+    app.settings.thing = Some("sensor-1".into());
+    let mut h = harness(app);
+    h.run_steps(2);
+
+    // Before connecting, the tab explains what's needed.
+    click(&mut h, "Shadows");
+    h.get_by_label_contains("Connect as a Thing on the Client tab");
+    click(&mut h, "Client");
+
+    click_containing(&mut h, "Load from AWS");
+    wait_until(&mut h, "the account", |a| {
+        a.aws.session.is_some() && !a.aws.busy()
+    });
+    click_button(&mut h, &format!("{} Connect", icons::PLUG));
+    wait_until(&mut h, "both shadows to load", |a| {
+        a.shadow.shadows.as_ref().is_some_and(|s| {
+            s.items.len() == 2
+                && s.items
+                    .values()
+                    .all(|sh| sh.status == shadow::Status::Loaded)
+        })
+    });
+    assert!(
+        fake.requests_to(
+            "GET",
+            "/api/things/shadow/ListNamedShadowsForThing/sensor-1"
+        )
+        .len()
+            == 1
+    );
+
+    click(&mut h, "Shadows 2");
+    assert_eq!(h.state().settings.view, View::Shadows);
+    {
+        let s = h.state().shadow.shadows.as_ref().unwrap();
+        let classic = &s.items[&shadow::ShadowName::Classic];
+        assert_eq!(classic.delta, Some(json!({ "led": "on" })));
+        assert_eq!(classic.version, Some(1));
+    }
+    assert!(
+        h.state().messages.is_empty(),
+        "shadow traffic isn't shown as messages"
+    );
+    // Shown under both Desired and Delta.
+    assert_eq!(h.get_all_by_label_contains("\"led\": \"on\"").count(), 2);
+
+    // Update the classic shadow's desired state.
+    h.state_mut().shadow.editor = "{ \"led\": \"off\" }".into();
+    h.run_steps(2);
+    click(&mut h, "Send update");
+    wait_until(&mut h, "the update to be applied", |a| {
+        let s = a.shadow.shadows.as_ref().unwrap();
+        let c = &s.items[&shadow::ShadowName::Classic];
+        c.version == Some(2) && c.delta.is_none() && !c.updating
+    });
+
+    // The editor follows the selected section.
+    click_button(&mut h, "Reported");
+    assert!(h.state().shadow.editor.contains("\"led\": \"off\""));
+    h.state_mut().shadow.editor = "[1, 2]".into();
+    h.run_steps(2);
+    click(&mut h, "Send update");
+    assert!(h
+        .state()
+        .shadow
+        .edit_error
+        .as_deref()
+        .unwrap()
+        .contains("object"));
+    click(&mut h, "Reset");
+    assert!(h.state().shadow.edit_error.is_none());
+    assert!(
+        h.state().shadow.editor.contains("\"led\": \"off\""),
+        "back to the reported state"
+    );
+
+    // Open a named shadow that doesn't exist yet, then create it with an update.
+    h.state_mut().shadow.new_name = "settings".into();
+    h.run_steps(2);
+    click(&mut h, "Open");
+    let settings = shadow::ShadowName::Named("settings".into());
+    wait_until(&mut h, "the missing shadow", |a| {
+        a.shadow.shadows.as_ref().unwrap().items[&settings].status == shadow::Status::Missing
+    });
+    h.state_mut().shadow.editor = "{ \"mode\": \"eco\" }".into();
+    h.run_steps(2);
+    click(&mut h, "Send update");
+    wait_until(&mut h, "the new shadow", |a| {
+        a.shadow.shadows.as_ref().unwrap().items[&settings].status == shadow::Status::Loaded
+    });
+    assert_eq!(h.state().shadows_tab_label(), "Shadows 3");
+
+    // Pick the named shadow from the list, and refresh everything.
+    h.get_by_role_and_label(Role::ListBoxOption, "config   v1")
+        .click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().shadow.selected,
+        Some(shadow::ShadowName::Named("config".into()))
+    );
+    click_button(&mut h, "Refresh shadows");
+    wait_until(&mut h, "the refresh", |a| {
+        !a.shadow.listing
+            && a.shadow
+                .shadows
+                .as_ref()
+                .unwrap()
+                .items
+                .values()
+                .all(|s| s.status == shadow::Status::Loaded)
+    });
+
+    // After disconnecting, the last known state stays visible but read-only.
+    click(&mut h, "Client");
+    click_button(&mut h, "Disconnect");
+    wait_until(&mut h, "the disconnect", |a| {
+        a.state == ConnectionState::Disconnected
+    });
+    click(&mut h, "Shadows 3");
+    h.get_by_label_contains("Disconnected. Showing the last known state.");
+}
+
+/// Client ID connections have no Thing, so no shadow requests are made.
+#[test]
+fn client_id_connections_have_no_shadows() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (port, roots) = broker::start(&rt, broker::Behavior::Accept);
+    let fake = FakeAws::new();
+    let dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["c".into()]).unwrap();
+    let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+    let mut app = test_app(rt, &fake, roots, port);
+    app.load_certificate(&cert);
+    app.load_private_key(&key);
+    app.settings.mode = IdentityMode::ClientId;
+    app.settings.custom_client_id = "tester".into();
+    let mut h = harness(app);
+    h.run_steps(2);
+    click_button(&mut h, &format!("{} Connect", icons::PLUG));
+    wait_until(&mut h, "the connection", |a| {
+        a.state == ConnectionState::Connected
+    });
+    assert!(h.state().shadow.shadows.is_none());
+    click(&mut h, "Shadows");
+    h.get_by_label_contains("Shadows belong to a Thing");
+    assert!(!h
+        .state()
+        .log
+        .entries()
+        .any(|e| e.details.contains("shadow")));
 }

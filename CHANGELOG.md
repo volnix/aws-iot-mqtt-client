@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-11-22
 
 ### Fixed
 
@@ -16,11 +16,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Icon-only buttons (refresh, unsubscribe, theme, close) now have names for screen readers.
 - Updated the file dialog library (`rfd`) to 0.18.
+- Updated `url` to 2.5.9 for a denial-of-service fix ([RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592)).
 - The project is maintained by Nick Volgas. Copyright notices, the Code of Conduct, and
   security reporting were updated to match.
 
 ### Added
 
+- Device Shadow support. Connecting as a Thing loads its classic and named shadows, and a new
+  **Shadows** tab shows their desired, reported, and delta state. You can update either state,
+  or create a named shadow, over MQTT as the device. Listing named shadows needs
+  `iot:ListNamedShadowsForThing`.
+- A macOS disk image (`.dmg`) to drag the app into Applications.
+- macOS releases are signed with a Developer ID and notarized by Apple, so the app opens
+  without Gatekeeper warnings.
 - Offline end-to-end tests: a fake of the AWS endpoints, a local TLS MQTT test broker, and UI
   tests that drive the real window. Line coverage went from about 60% to 92%.
 

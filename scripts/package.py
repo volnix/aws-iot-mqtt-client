@@ -8,10 +8,16 @@
     python3 scripts/package.py --target x86_64-unknown-linux-gnu
 
 Output goes to dist/:
-  macOS    aws-iot-mqtt-client-<version>-macos-<arch>.zip   (an .app bundle)
+  macOS    aws-iot-mqtt-client-<version>-macos-<arch>.dmg   (drag-to-Applications disk image)
+           aws-iot-mqtt-client-<version>-macos-<arch>.zip   (the same .app, zipped)
   Linux    aws-iot-mqtt-client-<version>-linux-<arch>.tar.gz
   Windows  aws-iot-mqtt-client-<version>-windows-<arch>.zip
 Each archive includes LICENSE, NOTICE, and README.md, and gets a matching .sha256 file.
+
+macOS signing (optional; without it the app gets an ad-hoc signature):
+  MACOS_SIGNING_IDENTITY  e.g. "Developer ID Application: Your Name (TEAMID)", in a keychain
+  NOTARY_KEY_PATH, NOTARY_KEY_ID, NOTARY_ISSUER_ID
+                          App Store Connect API key for notarization (only with an identity)
 
 Standard library only. The release workflow (.github/workflows/release.yml) runs this script,
 so local packages match the published ones.
@@ -85,11 +91,13 @@ def platform_of(target: str):
     return target.split("-")[2] if target.count("-") >= 2 else "unknown", arch
 
 
-def build(target: str) -> Path:
-    env = dict(os.environ)
-    if "apple-darwin" in target:
-        env.setdefault("MACOSX_DEPLOYMENT_TARGET", MACOS_MIN)
-    run(["cargo", "build", "--release", "--locked", "--bin", BINARY, "--target", target], env=env)
+def build(target: str, skip_build: bool = False) -> Path:
+    if not skip_build:
+        env = dict(os.environ)
+        if "apple-darwin" in target:
+            env.setdefault("MACOSX_DEPLOYMENT_TARGET", MACOS_MIN)
+        run(["cargo", "build", "--release", "--locked", "--bin", BINARY, "--target", target],
+            env=env)
     exe = BINARY + (".exe" if "windows" in target else "")
     path = ROOT / "target" / target / "release" / exe
     if not path.is_file():
@@ -125,7 +133,45 @@ def info_plist(version: str) -> str:
 """
 
 
-def package_macos(binary: Path, version: str, arch: str, dist: Path) -> Path:
+class Signing:
+    """Developer ID signing and notarization settings, from the environment."""
+
+    def __init__(self) -> None:
+        self.identity = os.environ.get("MACOS_SIGNING_IDENTITY", "").strip()
+        self.notary = [
+            os.environ.get(k, "").strip()
+            for k in ("NOTARY_KEY_PATH", "NOTARY_KEY_ID", "NOTARY_ISSUER_ID")
+        ]
+        if any(self.notary) and not all(self.notary):
+            sys.exit("Set all of NOTARY_KEY_PATH, NOTARY_KEY_ID, and NOTARY_ISSUER_ID, or none")
+        if all(self.notary) and not self.identity:
+            sys.exit("Notarization needs MACOS_SIGNING_IDENTITY too")
+
+    @property
+    def notarize(self) -> bool:
+        return bool(self.identity) and all(self.notary)
+
+    def sign(self, path: Path) -> None:
+        if self.identity:
+            # Hardened runtime and a secure timestamp are both required for notarization.
+            run(["codesign", "--force", "--options", "runtime", "--timestamp",
+                 "--sign", self.identity, str(path)])
+            run(["codesign", "--verify", "--strict", "--verbose=2", str(path)])
+        elif shutil.which("codesign"):
+            # Ad-hoc signature: required for arm64 executables and keeps the bundle consistent.
+            # It is not a Developer ID signature, so Gatekeeper still asks on first launch.
+            run(["codesign", "--force", "--sign", "-", str(path)])
+
+    def notarize_and_staple(self, upload: Path, staple: Path) -> None:
+        """Submits `upload` (a zip or dmg) to Apple's notary service, waits for the result,
+        and attaches the ticket to `staple` so it opens offline too."""
+        key_path, key_id, issuer = self.notary
+        run(["xcrun", "notarytool", "submit", str(upload), "--key", key_path,
+             "--key-id", key_id, "--issuer", issuer, "--wait"])
+        run(["xcrun", "stapler", "staple", str(staple)])
+
+
+def package_macos(binary: Path, version: str, arch: str, dist: Path) -> list:
     stage = dist / "stage"
     app = stage / f"{APP_NAME}.app"
     (app / "Contents" / "MacOS").mkdir(parents=True)
@@ -134,17 +180,44 @@ def package_macos(binary: Path, version: str, arch: str, dist: Path) -> Path:
     (app / "Contents" / "Info.plist").write_text(info_plist(version), encoding="utf-8")
     for doc in DOCS:
         shutil.copy2(ROOT / doc, app / "Contents" / "Resources" / doc)
-    if shutil.which("codesign"):
-        # Ad-hoc signature: required for arm64 executables and keeps the bundle consistent.
-        # It is not a Developer ID signature, so Gatekeeper still asks on first launch.
-        run(["codesign", "--force", "--deep", "--sign", "-", str(app)])
-    archive = dist / f"{BINARY}-{version}-macos-{arch}.zip"
+
+    signing = Signing()
+    signing.sign(app)
+    if signing.notarize:
+        upload = dist / "notarize-upload.zip"
+        run(["ditto", "-c", "-k", "--keepParent", str(app), str(upload)])
+        signing.notarize_and_staple(upload, app)
+        upload.unlink()
+
+    name = f"{BINARY}-{version}-macos-{arch}"
+    archive = dist / f"{name}.zip"
     if shutil.which("ditto"):
-        # ditto keeps the bundle's permissions and extended attributes intact.
+        # ditto keeps the bundle's permissions, extended attributes, and stapled ticket intact.
         run(["ditto", "-c", "-k", "--keepParent", str(app), str(archive)])
     else:
         zip_dir(stage, archive)
-    return archive
+    archives = [archive]
+
+    if shutil.which("hdiutil"):
+        # A disk image showing the app next to an Applications shortcut, to drag it across.
+        dmg_root = dist / "dmg"
+        if dmg_root.exists():
+            shutil.rmtree(dmg_root)
+        dmg_root.mkdir()
+        run(["ditto", str(app), str(dmg_root / app.name)])
+        (dmg_root / "Applications").symlink_to("/Applications")
+        dmg = dist / f"{name}.dmg"
+        if dmg.exists():
+            dmg.unlink()
+        run(["hdiutil", "create", "-volname", APP_NAME, "-srcfolder", str(dmg_root),
+             "-fs", "HFS+", "-format", "UDZO", "-ov", str(dmg)])
+        shutil.rmtree(dmg_root)
+        if signing.identity:
+            signing.sign(dmg)
+        if signing.notarize:
+            signing.notarize_and_staple(dmg, dmg)
+        archives.append(dmg)
+    return archives
 
 
 def package_tar(binary: Path, name: str, archive: Path) -> Path:
@@ -182,6 +255,11 @@ def main() -> int:
     )
     parser.add_argument("--out", default="dist", help="output directory (default: dist)")
     parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="package binaries already built by a previous run (used to sign without compiling)",
+    )
+    parser.add_argument(
         "--expect-version",
         help="fail unless Cargo.toml has this version (used by the release workflow)",
     )
@@ -203,28 +281,31 @@ def main() -> int:
     if args.macos_universal:
         if sys.platform != "darwin":
             sys.exit("--macos-universal needs macOS (it uses lipo)")
-        slices = [build(t) for t in ("aarch64-apple-darwin", "x86_64-apple-darwin")]
+        slices = [
+            build(t, args.skip_build) for t in ("aarch64-apple-darwin", "x86_64-apple-darwin")
+        ]
         stage.mkdir(parents=True)
         binary = stage / BINARY
         run(["lipo", "-create", "-output", str(binary), *map(str, slices)])
-        archive = package_macos(binary, version, "universal", dist)
+        archives = package_macos(binary, version, "universal", dist)
     else:
         target = args.target or host_target()
         system, arch = platform_of(target)
-        binary = build(target)
+        binary = build(target, args.skip_build)
         name = f"{BINARY}-{version}-{system}-{arch}"
         if system == "macos":
-            archive = package_macos(binary, version, arch, dist)
+            archives = package_macos(binary, version, arch, dist)
         elif system == "windows":
-            archive = package_zip(binary, name, dist / f"{name}.zip")
+            archives = [package_zip(binary, name, dist / f"{name}.zip")]
         else:
-            archive = package_tar(binary, name, dist / f"{name}.tar.gz")
+            archives = [package_tar(binary, name, dist / f"{name}.tar.gz")]
 
     if stage.exists():
         shutil.rmtree(stage)
-    checksum = sha256_file(archive)
-    log(f"created {archive.relative_to(ROOT)}")
-    log(f"checksum {checksum.relative_to(ROOT)}")
+    for archive in archives:
+        checksum = sha256_file(archive)
+        log(f"created {archive.relative_to(ROOT)}")
+        log(f"checksum {checksum.relative_to(ROOT)}")
     return 0
 
 

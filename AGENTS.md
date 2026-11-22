@@ -40,6 +40,9 @@ python3 scripts/generate_notice.py --check   # only fails if dependencies change
   - Every call goes through `Session::call` in `src/aws.rs`, which handles the timeout,
     request/response logging, and request IDs.
   - Never put secrets, PEMs, or private keys in its request string or summary closure.
+- **Shadows** are read and updated over MQTT as the device (`src/shadow.rs`), never through
+  the `UpdateThingShadow`/`DeleteThingShadow` APIs. The only shadow API call is the read-only
+  `ListNamedShadowsForThing`. The app doesn't delete shadows.
 - **Writes to AWS** exist only in `src/provision.rs`, behind the user's confirmation in the
   Create certificate dialog. Don't add others. Never delete or roll back AWS resources.
 - **Persisted `Settings`** (in `src/app.rs`) use `#[serde(default)]`. New fields need a
@@ -113,3 +116,6 @@ python3 scripts/generate_notice.py --check   # only fails if dependencies change
 - **Release packaging:** `.github/workflows/release.yml` packages through `scripts/package.py`.
   Change packaging in the script, not the workflow, and test it locally with
   `python3 scripts/package.py`.
+- **Signing secrets:** never expose them to a step that compiles. Dependency build scripts
+  run during `cargo build`. The release workflow builds first, then signs in a separate step
+  with `package.py --skip-build`.
