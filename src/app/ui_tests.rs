@@ -891,7 +891,13 @@ fn shadow_form_renders_every_field_type() {
         // Each group has its own "Add field"; the top-level one comes last.
         let adds: Vec<_> = h.get_all_by_label_contains("Add field").collect();
         assert_eq!(adds.len(), 3, "top level, color, and color.mode");
-        adds.last().unwrap().click();
+        // Fonts differ by platform, so it may be below the visible area.
+        adds.last().unwrap().scroll_to_me();
+        h.run_steps(3);
+        h.get_all_by_label_contains("Add field")
+            .last()
+            .unwrap()
+            .click();
         h.run_steps(2);
         assert_eq!(h.state().shadow.fields.len(), 7);
         h.get_by_label_contains("A field needs a name");
@@ -1006,6 +1012,8 @@ fn mosquitto_commands_can_be_copied() {
     click_button(&mut h, "Copy as mosquitto_pub");
     h.run_steps(3);
     h.get_by_label("mosquitto_pub command");
+    // The dialog starts in PowerShell on Windows; these checks use the POSIX form.
+    click(&mut h, "macOS / Linux");
     let pubc = command(h.state());
     assert!(pubc.contains("-t sensors/1"), "{pubc}");
     assert!(pubc.contains("-q 1"), "{pubc}");
