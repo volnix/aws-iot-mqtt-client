@@ -39,6 +39,7 @@ APP_NAME = "AWS IoT MQTT Client"
 BUNDLE_ID = "io.github.volnix.aws-iot-mqtt-client"
 MACOS_MIN = "11.0"
 DOCS = ["LICENSE", "NOTICE", "README.md"]
+ICON = ROOT / "assets" / "icon" / "icon.png"
 
 
 def log(message: str) -> None:
@@ -122,6 +123,7 @@ def info_plist(version: str) -> str:
   <key>CFBundleDisplayName</key><string>{APP_NAME}</string>
   <key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string>
   <key>CFBundleExecutable</key><string>{BINARY}</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>{version}</string>
   <key>CFBundleVersion</key><string>{version}</string>
@@ -180,6 +182,14 @@ def package_macos(binary: Path, version: str, arch: str, dist: Path) -> list:
     (app / "Contents" / "Info.plist").write_text(info_plist(version), encoding="utf-8")
     for doc in DOCS:
         shutil.copy2(ROOT / doc, app / "Contents" / "Resources" / doc)
+    icns = app / "Contents" / "Resources" / "AppIcon.icns"
+    if shutil.which("iconutil"):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from make_icons import macos_icns  # noqa: E402
+
+        macos_icns(ICON, icns)
+    else:
+        log("iconutil not found; the app bundle won't have an icon")
 
     signing = Signing()
     signing.sign(app)
@@ -209,8 +219,29 @@ def package_macos(binary: Path, version: str, arch: str, dist: Path) -> list:
         dmg = dist / f"{name}.dmg"
         if dmg.exists():
             dmg.unlink()
+        volume_icon = icns.exists() and shutil.which("SetFile")
+        if volume_icon:
+            shutil.copy2(icns, dmg_root / ".VolumeIcon.icns")
+        # Build it writable, mark the mounted volume as having a custom icon (the flag only
+        # sticks on a mounted volume), then compress.
+        rw = dist / "rw.dmg"
+        if rw.exists():
+            rw.unlink()
         run(["hdiutil", "create", "-volname", APP_NAME, "-srcfolder", str(dmg_root),
-             "-fs", "HFS+", "-format", "UDZO", "-ov", str(dmg)])
+             "-fs", "HFS+", "-format", "UDRW", "-ov", str(rw)])
+        if volume_icon:
+            mount = dist / "mnt"
+            mount.mkdir(exist_ok=True)
+            run(["hdiutil", "attach", "-nobrowse", "-noautoopen", "-mountpoint", str(mount),
+                 str(rw)])
+            try:
+                run(["SetFile", "-a", "C", str(mount)])
+            finally:
+                run(["hdiutil", "detach", "-force", str(mount)])
+            mount.rmdir()
+        run(["hdiutil", "convert", str(rw), "-format", "UDZO", "-imagekey", "zlib-level=9",
+             "-o", str(dmg)])
+        rw.unlink()
         shutil.rmtree(dmg_root)
         if signing.identity:
             signing.sign(dmg)

@@ -13,7 +13,9 @@ use egui_kittest::Harness;
 use serde_json::json;
 
 use super::*;
+use crate::packet_log::Replay;
 use crate::shadow;
+use crate::shadow_fields::FieldValue;
 use crate::test_support::{broker, FakeAws};
 
 const ACCOUNT: &str = "123456789012";
@@ -570,19 +572,23 @@ fn shadows_tab_lists_shows_and_updates_shadows() {
     let mut app = test_app(rt, &fake, roots, port);
     app.load_certificate(&cert);
     app.load_private_key(&key);
-    app.settings.thing = Some("sensor-1".into());
     let mut h = harness(app);
     h.run_steps(2);
 
-    // Before connecting, the tab explains what's needed.
+    // Connect from the Shadows tab's own short form: account, Thing, certificate, Connect.
     click(&mut h, "Shadows");
-    h.get_by_label_contains("Connect as a Thing on the Client tab");
-    click(&mut h, "Client");
-
+    h.get_by_label("Connect to see shadows");
+    assert!(
+        h.query_by_label("Protocol").is_none(),
+        "advanced connection settings stay on the Client tab"
+    );
     click_containing(&mut h, "Load from AWS");
     wait_until(&mut h, "the account", |a| {
         a.aws.session.is_some() && !a.aws.busy()
     });
+    h.get_by_role_and_label(Role::ListBoxOption, "sensor-1")
+        .click();
+    h.run_steps(2);
     click_button(&mut h, &format!("{} Connect", icons::PLUG));
     wait_until(&mut h, "both shadows to load", |a| {
         a.shadow.shadows.as_ref().is_some_and(|s| {
@@ -601,8 +607,11 @@ fn shadows_tab_lists_shows_and_updates_shadows() {
             == 1
     );
 
-    click(&mut h, "Shadows 2");
-    assert_eq!(h.state().settings.view, View::Shadows);
+    assert_eq!(
+        h.state().settings.view,
+        View::Shadows,
+        "still on the Shadows tab"
+    );
     {
         let s = h.state().shadow.shadows.as_ref().unwrap();
         let classic = &s.items[&shadow::ShadowName::Classic];
@@ -616,17 +625,99 @@ fn shadows_tab_lists_shows_and_updates_shadows() {
     // Shown under both Desired and Delta.
     assert_eq!(h.get_all_by_label_contains("\"led\": \"on\"").count(), 2);
 
-    // Update the classic shadow's desired state.
-    h.state_mut().shadow.editor = "{ \"led\": \"off\" }".into();
+    // The form editor starts with the desired state's fields.
+    let desired = |a: &MqttApp| {
+        a.shadow.shadows.as_ref().unwrap().items[&shadow::ShadowName::Classic]
+            .desired
+            .clone()
+    };
+    assert_eq!(h.state().shadow.mode, shadows::EditMode::Fields);
+    assert_eq!(h.state().shadow.fields.len(), 1);
+    h.get_by_label("led");
+
+    // Change a value and send it.
+    h.state_mut().shadow.fields[0].value = FieldValue::Text("off".into());
     h.run_steps(2);
     click(&mut h, "Send update");
     wait_until(&mut h, "the update to be applied", |a| {
-        let s = a.shadow.shadows.as_ref().unwrap();
-        let c = &s.items[&shadow::ShadowName::Classic];
+        let c = &a.shadow.shadows.as_ref().unwrap().items[&shadow::ShadowName::Classic];
         c.version == Some(2) && c.delta.is_none() && !c.updating
     });
 
-    // The editor follows the selected section.
+    // Add a number field. A bad number is flagged and blocks sending.
+    click_containing(&mut h, "Add field");
+    {
+        let added = h.state_mut().shadow.fields.last_mut().unwrap();
+        assert!(!added.existing);
+        added.key = "brightness".into();
+        added.value = FieldValue::Number("8o".into());
+    }
+    h.run_steps(2);
+    h.get_by_label_contains("isn't a number");
+    h.state_mut().shadow.fields.last_mut().unwrap().value = FieldValue::Number("80".into());
+    h.run_steps(2);
+    click(&mut h, "Send update");
+    wait_until(&mut h, "the new field", |a| {
+        desired(a) == Some(json!({ "led": "off", "brightness": 80 }))
+    });
+
+    // Removing an existing field deletes it from the shadow (it's sent as null), with undo.
+    // Remove buttons follow the field order, which depends on serde_json's features.
+    let led_row = |a: &MqttApp| a.shadow.fields.iter().position(|f| f.key == "led").unwrap();
+    let row = led_row(h.state());
+    h.get_all_by_label("Remove field").nth(row).unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Removed when you send");
+    click(&mut h, "Undo");
+    assert!(h.query_by_label("Removed when you send").is_none());
+    let row = led_row(h.state());
+    h.get_all_by_label("Remove field").nth(row).unwrap().click();
+    h.run_steps(2);
+    click(&mut h, "Send update");
+    wait_until(&mut h, "the field to be deleted", |a| {
+        desired(a) == Some(json!({ "brightness": 80 }))
+    });
+    assert_eq!(
+        h.state().shadow.fields.len(),
+        1,
+        "the form reloads from the shadow"
+    );
+
+    // Switch to JSON: the fields carry over. Invalid JSON can't switch back to fields.
+    click(&mut h, "JSON");
+    assert_eq!(h.state().shadow.mode, shadows::EditMode::Json);
+    assert!(h.state().shadow.editor.contains("\"brightness\": 80"));
+    h.state_mut().shadow.editor = "{ \"brightness\": ".into();
+    h.run_steps(2);
+    click(&mut h, "Fields");
+    assert_eq!(h.state().shadow.mode, shadows::EditMode::Json);
+    assert!(h
+        .state()
+        .shadow
+        .edit_error
+        .as_deref()
+        .unwrap()
+        .contains("valid object"));
+    h.state_mut().shadow.editor = "{ \"brightness\": 50, \"fan\": 2 }".into();
+    h.run_steps(2);
+    click(&mut h, "Fields");
+    assert_eq!(h.state().shadow.mode, shadows::EditMode::Fields);
+    let keys: Vec<_> = h
+        .state()
+        .shadow
+        .fields
+        .iter()
+        .map(|f| (f.key.clone(), f.existing))
+        .collect();
+    assert_eq!(
+        keys,
+        [("brightness".to_owned(), true), ("fan".to_owned(), false)],
+        "only fields already in the shadow are marked existing"
+    );
+    click(&mut h, "Reset");
+
+    // In JSON mode, the editor follows the selected section.
+    click(&mut h, "JSON");
     click_button(&mut h, "Reported");
     assert!(h.state().shadow.editor.contains("\"led\": \"off\""));
     h.state_mut().shadow.editor = "[1, 2]".into();
@@ -660,7 +751,8 @@ fn shadows_tab_lists_shows_and_updates_shadows() {
     wait_until(&mut h, "the new shadow", |a| {
         a.shadow.shadows.as_ref().unwrap().items[&settings].status == shadow::Status::Loaded
     });
-    assert_eq!(h.state().shadows_tab_label(), "Shadows 3");
+    // The count sits under the list's title, not in the tab.
+    h.get_by_label("3 active");
 
     // Pick the named shadow from the list, and refresh everything.
     h.get_by_role_and_label(Role::ListBoxOption, "config   v1")
@@ -682,14 +774,25 @@ fn shadows_tab_lists_shows_and_updates_shadows() {
                 .all(|s| s.status == shadow::Status::Loaded)
     });
 
-    // After disconnecting, the last known state stays visible but read-only.
+    // After disconnecting, the last known state stays visible, with a Connect button.
     click(&mut h, "Client");
     click_button(&mut h, "Disconnect");
     wait_until(&mut h, "the disconnect", |a| {
         a.state == ConnectionState::Disconnected
     });
-    click(&mut h, "Shadows 3");
+    click_button(&mut h, "Shadows");
     h.get_by_label_contains("Disconnected. Showing the last known state.");
+    click_button(&mut h, &format!("{} Connect", icons::PLUG));
+    wait_until(&mut h, "the reconnect and reload", |a| {
+        a.state == ConnectionState::Connected
+            && a.shadow.shadows.as_ref().is_some_and(|s| {
+                // Rebuilt from the account's list, which the fake doesn't update.
+                s.items.len() == 2
+                    && s.items
+                        .values()
+                        .all(|sh| sh.status == shadow::Status::Loaded)
+            })
+    });
 }
 
 /// Client ID connections have no Thing, so no shadow requests are made.
@@ -710,16 +813,523 @@ fn client_id_connections_have_no_shadows() {
     app.settings.custom_client_id = "tester".into();
     let mut h = harness(app);
     h.run_steps(2);
+
+    // Not connected yet: the Shadows tab offers to switch to a Thing.
+    click(&mut h, "Shadows");
+    h.get_by_label_contains("set to connect with a client ID");
+    click(&mut h, "Use an IoT Thing");
+    assert_eq!(h.state().settings.mode, IdentityMode::Thing);
+    h.state_mut().settings.mode = IdentityMode::ClientId;
+    click(&mut h, "Client");
+
     click_button(&mut h, &format!("{} Connect", icons::PLUG));
     wait_until(&mut h, "the connection", |a| {
         a.state == ConnectionState::Connected
     });
     assert!(h.state().shadow.shadows.is_none());
     click(&mut h, "Shadows");
-    h.get_by_label_contains("Shadows belong to a Thing");
+    h.get_by_label_contains("connected with a client ID, which has no shadows");
     assert!(!h
         .state()
         .log
         .entries()
         .any(|e| e.details.contains("shadow")));
+}
+
+/// The form editor renders every field type, nested groups, and a removed field, in both themes.
+#[test]
+fn shadow_form_renders_every_field_type() {
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let rt = Arc::new(Runtime::new().unwrap());
+        let mut app = test_app(rt, &FakeAws::new(), rustls::RootCertStore::empty(), 1);
+        app.settings.view = View::Shadows;
+        let doc = json!({
+            "name": "lamp", "level": 3.5, "on": true, "tags": ["a", 1], "gone": null,
+            "color": { "r": 255, "mode": { "kind": "rgb" } },
+        });
+        let mut shadows = shadow::Shadows::new("t1");
+        let s = shadows.get_or_insert(shadow::ShadowName::Classic);
+        s.status = shadow::Status::Loaded;
+        s.desired = Some(doc.clone());
+        s.version = Some(4);
+        s.timestamp = Some(1_700_000_000);
+        app.shadow.shadows = Some(shadows);
+        app.shadow.selected = Some(shadow::ShadowName::Classic);
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1400.0, 1000.0))
+            .with_theme(theme)
+            .with_context_setup(|ctx| {
+                fonts::install(ctx);
+                theme::install(ctx);
+            })
+            .with_accessibility_check(false)
+            .build_ui_state(|ui, app: &mut MqttApp| app.frame(ui), app);
+        h.run_steps(2);
+        assert_eq!(h.state().shadow.fields.len(), 6);
+        h.get_by_label("2 fields");
+        // True/false is a pair of radio buttons.
+        let on = |a: &MqttApp| {
+            a.shadow
+                .fields
+                .iter()
+                .find(|f| f.key == "on")
+                .unwrap()
+                .value
+                .clone()
+        };
+        assert_eq!(on(h.state()), FieldValue::Bool(true));
+        h.get_by_label("False").click();
+        h.run_steps(2);
+        assert_eq!(on(h.state()), FieldValue::Bool(false));
+        h.get_by_label("True").click();
+        h.run_steps(2);
+        assert_eq!(on(h.state()), FieldValue::Bool(true));
+        h.get_by_label("mode");
+        h.get_all_by_label("Remove field").next().unwrap().click();
+        h.run_steps(2);
+        h.get_by_label("Removed when you send");
+        // Each group has its own "Add field"; the top-level one comes last.
+        let adds: Vec<_> = h.get_all_by_label_contains("Add field").collect();
+        assert_eq!(adds.len(), 3, "top level, color, and color.mode");
+        adds.last().unwrap().click();
+        h.run_steps(2);
+        assert_eq!(h.state().shadow.fields.len(), 7);
+        h.get_by_label_contains("A field needs a name");
+    }
+}
+
+/// Sent PUBLISH and SUBSCRIBE rows in the MQTT log copy as `mosquitto_pub`/`mosquitto_sub`, in
+/// either shell. Acks and received packets have no copy button.
+#[test]
+fn mosquitto_commands_can_be_copied() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (port, roots) = broker::start(&rt, broker::Behavior::Accept);
+    let dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["c".into()]).unwrap();
+    let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("my key.pem"));
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+    let mut app = test_app(rt, &FakeAws::new(), roots, port);
+    app.load_certificate(&cert);
+    app.load_private_key(&key);
+    app.settings.mode = IdentityMode::ClientId;
+    app.settings.custom_client_id = "tester".into();
+    app.settings.mqtt_version = MqttVersion::V311;
+    let mut h = harness(app);
+    h.run_steps(2);
+    click_button(&mut h, &format!("{} Connect", icons::PLUG));
+    wait_until(&mut h, "the connection", |a| {
+        a.state == ConnectionState::Connected
+    });
+
+    // Subscribe and publish (QoS 1 and retained), so the log has both kinds plus their acks.
+    h.state_mut().settings.subscribe_filter = "sensors/#".into();
+    h.run_steps(2);
+    click_button(&mut h, "Subscribe");
+    h.state_mut().settings.publish_topic = "sensors/1".into();
+    h.state_mut().publish_retain = true;
+    h.state_mut().publish_payload = "{\n  \"t\": 21\n}".into();
+    h.run_steps(2);
+    click_containing(&mut h, "Send");
+    wait_until(&mut h, "the echoed message", |a| !a.messages.is_empty());
+    assert!(
+        h.query_by_label("Copy as mosquitto_sub").is_none(),
+        "no copy buttons outside the log"
+    );
+
+    click_containing(&mut h, "Logs ");
+    assert_eq!(h.get_all_by_label("Copy as mosquitto_sub").count(), 1);
+    assert_eq!(
+        h.get_all_by_label("Copy as mosquitto_pub").count(),
+        1,
+        "only the sent PUBLISH, not the echoed one or any ack"
+    );
+    let copy = h.get_by_label("Copy as mosquitto_sub");
+    assert!(
+        copy.rect().height() < 24.0,
+        "fits in a log row: {:?}",
+        copy.rect()
+    );
+    // The SUBSCRIBE row is above the log's visible area; scroll to it like a user would.
+    h.get_by_label("Copy as mosquitto_sub").scroll_to_me();
+    h.run_steps(3);
+    click_button(&mut h, "Copy as mosquitto_sub");
+    // A modal takes a few frames to size itself before it's shown.
+    h.run_steps(3);
+    h.get_by_label("mosquitto_sub command");
+    let command = |a: &MqttApp| a.cli_command(a.cli.as_ref().unwrap());
+    let sub = command(h.state());
+    for part in [
+        "mosquitto_sub",
+        "-i tester",
+        "-V mqttv311",
+        &format!("-p {port}"),
+        "-t 'sensors/#'",
+        "--cafile AmazonRootCA1.pem",
+        "my key.pem'",
+    ] {
+        assert!(sub.contains(part), "missing {part:?} in\n{sub}");
+    }
+    h.get_by_label_contains("one connection per client ID");
+    click(&mut h, "PowerShell");
+    assert!(command(h.state()).starts_with("Invoke-WebRequest"));
+    click(&mut h, "macOS / Linux");
+    h.get_by_role_and_label(Role::Button, &format!("{} Copy", icons::COPY))
+        .click();
+    h.step();
+    let copied: Vec<_> = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        copied,
+        [command(h.state())],
+        "the command goes to the clipboard"
+    );
+    h.run_steps(1);
+    assert!(h.state().cli.as_ref().unwrap().copied);
+    h.run_steps(2); // a new area sizes itself before it shows
+    h.get_by_label("Command copied to the clipboard");
+    h.get_by_label(&format!("{} Copied", icons::CHECK));
+    click(&mut h, "Close");
+    assert!(h.state().cli.is_none());
+
+    // The publish carries its full topic, QoS, retain flag, and payload.
+    h.get_by_label("Copy as mosquitto_pub").scroll_to_me();
+    h.run_steps(3);
+    click_button(&mut h, "Copy as mosquitto_pub");
+    h.run_steps(3);
+    h.get_by_label("mosquitto_pub command");
+    let pubc = command(h.state());
+    assert!(pubc.contains("-t sensors/1"), "{pubc}");
+    assert!(pubc.contains("-q 1"), "{pubc}");
+    assert!(pubc.contains("  -r \\"), "{pubc}");
+    assert!(pubc.ends_with("-m '{\"t\":21}'"), "{pubc}");
+    click(&mut h, "Close");
+}
+
+/// If the shadow subscription disappears (here: unsubscribed behind the app's back), an update
+/// times out instead of spinning forever, and the app subscribes again and reloads. The
+/// subscription is marked as the app's own in the Subscriptions list, with no unsubscribe.
+#[test]
+fn lost_shadow_subscription_recovers_instead_of_hanging() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (port, roots) = broker::start_with_shadows(
+        &rt,
+        broker::Behavior::Accept,
+        vec![(
+            "$aws/things/sensor-1/shadow".into(),
+            json!({ "desired": { "led": "on" } }),
+        )],
+    );
+    let filter = "$aws/things/sensor-1/shadow/#";
+    let fake = account_fake()
+        .json(
+            "GET",
+            "/api/things/shadow/ListNamedShadowsForThing/sensor-1",
+            json!({ "results": [] }),
+        )
+        .json(
+            "GET",
+            "/connections/sensor-1/subscriptions",
+            json!({ "subscriptions": [{ "topicFilter": filter, "qos": 1 }] }),
+        );
+    let dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["sensor-1".into()]).unwrap();
+    let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+    let mut app = test_app(rt, &fake, roots, port);
+    app.load_certificate(&cert);
+    app.load_private_key(&key);
+    app.shadow.timeout = Duration::from_secs(1);
+    let mut h = harness(app);
+    h.run_steps(2);
+    click_containing(&mut h, "Load from AWS");
+    wait_until(&mut h, "the account", |a| {
+        a.aws.session.is_some() && !a.aws.busy()
+    });
+    h.get_by_role_and_label(Role::ListBoxOption, "sensor-1")
+        .click();
+    h.run_steps(2);
+    click_button(&mut h, &format!("{} Connect", icons::PLUG));
+    let classic = |a: &MqttApp| {
+        a.shadow
+            .shadows
+            .as_ref()
+            .and_then(|s| s.items.get(&shadow::ShadowName::Classic))
+            .cloned()
+    };
+    wait_until(&mut h, "the shadow", |a| {
+        classic(a).is_some_and(|c| c.status == shadow::Status::Loaded)
+    });
+
+    // The app's own subscription can't be unsubscribed from the list.
+    wait_until(&mut h, "the subscription list", |a| {
+        matches!(a.live.subscriptions, Some(Ok(_)))
+    });
+    h.get_by_label("Used by Shadows");
+    assert!(h.query_by_label("Unsubscribe").is_none());
+
+    // Drop it behind the app's back, then update.
+    h.state()
+        .connection
+        .as_ref()
+        .unwrap()
+        .unsubscribe(filter, &[])
+        .unwrap();
+    wait_until(&mut h, "the unsubscribe", |a| {
+        a.log.entries().any(|e| e.kind == "UNSUBACK")
+    });
+    click_button(&mut h, "Shadows");
+    h.state_mut().shadow.fields[0].value = FieldValue::Text("off".into());
+    h.run_steps(2);
+    click(&mut h, "Send update");
+    assert!(classic(h.state()).unwrap().updating);
+
+    // It times out (not a forever spinner), resubscribes, and reloads the applied update.
+    wait_until(&mut h, "the timeout and recovery", |a| {
+        classic(a).is_some_and(|c| {
+            !c.updating && c.status == shadow::Status::Loaded && c.version == Some(2)
+        })
+    });
+    let c = classic(h.state()).unwrap();
+    assert!(c
+        .update_error
+        .as_deref()
+        .unwrap()
+        .contains("may still have been applied"));
+    assert_eq!(c.desired, Some(json!({ "led": "off" })));
+    let subscribes = h
+        .state()
+        .log
+        .entries()
+        .filter(|e| {
+            e.kind == "SUBSCRIBE"
+                && matches!(&e.replay, Some(Replay::Subscribe { filter: f, .. }) if f == filter)
+        })
+        .count();
+    assert_eq!(subscribes, 2, "subscribed again after the timeout");
+    assert!(h.state().shadow.subscribed);
+}
+
+/// MQTT 5 User Properties: edited for CONNECT, PUBLISH, and SUBSCRIBE, shown on received
+/// messages, and carried into the copied mosquitto commands. Hidden for MQTT 3.1.1.
+#[test]
+fn user_properties_are_sent_shown_and_copied() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (port, roots) = broker::start(&rt, broker::Behavior::Accept);
+    let dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["c".into()]).unwrap();
+    let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+    let mut app = test_app(rt, &FakeAws::new(), roots, port);
+    app.load_certificate(&cert);
+    app.load_private_key(&key);
+    app.settings.mode = IdentityMode::ClientId;
+    app.settings.custom_client_id = "tester".into();
+    app.settings.mqtt_version = MqttVersion::V311;
+    let mut h = harness(app);
+    h.run_steps(2);
+
+    // MQTT 3.1.1 has no User Properties.
+    click_button(&mut h, "Advanced");
+    h.get_by_label("User properties need MQTT 5.");
+    h.state_mut().settings.mqtt_version = MqttVersion::V5;
+    h.run_steps(2);
+    h.get_by_label("Sent with CONNECT.");
+
+    // CONNECT properties: add a row; an empty name isn't sent.
+    click_containing(&mut h, "Add property");
+    h.state_mut().settings.connect_user_properties[0] = ("app".into(), "ui-test".into());
+    h.state_mut()
+        .settings
+        .connect_user_properties
+        .push((String::new(), "ignored".into()));
+    h.run_steps(2);
+    h.get_by_label("1 user property");
+    click_button(&mut h, "Advanced");
+
+    click_button(&mut h, &format!("{} Connect", icons::PLUG));
+    wait_until(&mut h, "the connection", |a| {
+        a.state == ConnectionState::Connected
+    });
+    let connect = h
+        .state()
+        .log
+        .entries()
+        .find(|e| e.kind == "CONNECT")
+        .unwrap()
+        .details
+        .clone();
+    assert!(
+        connect.contains("user_properties=[app=ui-test]"),
+        "{connect}"
+    );
+    assert!(!connect.contains("ignored"), "{connect}");
+
+    // SUBSCRIBE and PUBLISH properties, each behind its own toggle.
+    click_button(&mut h, "User properties for subscribe and unsubscribe");
+    h.state_mut().settings.subscription_user_properties = vec![("sub".into(), "yes".into())];
+    h.state_mut().settings.subscribe_filter = "sensors/#".into();
+    h.run_steps(2);
+    click_button(&mut h, "Subscribe");
+    click_button(&mut h, "User properties");
+    h.state_mut().settings.publish_user_properties = vec![("source".into(), "ui".into())];
+    h.state_mut().settings.publish_topic = "sensors/1".into();
+    h.state_mut().publish_payload = "hi".into();
+    h.run_steps(2);
+    click_containing(&mut h, "Send");
+    wait_until(&mut h, "the echoed message", |a| !a.messages.is_empty());
+    assert_eq!(
+        h.state().messages[0].user_properties,
+        [("source".to_owned(), "ui".to_owned())]
+    );
+    // Properties sit behind a toggle under the payload.
+    assert!(h.query_by_label("source: ui").is_none());
+    click_button(&mut h, "User properties (1)");
+    h.get_by_label("source: ui");
+
+    // The copied commands carry each packet's own properties, plus CONNECT's.
+    click_containing(&mut h, "Logs ");
+    let command = |a: &MqttApp| a.cli_command(a.cli.as_ref().unwrap());
+    h.get_by_label("Copy as mosquitto_pub").scroll_to_me();
+    h.run_steps(3);
+    click_button(&mut h, "Copy as mosquitto_pub");
+    h.run_steps(3);
+    let pubc = command(h.state());
+    assert!(
+        pubc.contains("-D publish user-property source ui"),
+        "{pubc}"
+    );
+    assert!(
+        pubc.contains("-D connect user-property app ui-test"),
+        "{pubc}"
+    );
+    click(&mut h, "Close");
+    h.get_by_label("Copy as mosquitto_sub").scroll_to_me();
+    h.run_steps(3);
+    click_button(&mut h, "Copy as mosquitto_sub");
+    h.run_steps(3);
+    let subc = command(h.state());
+    assert!(
+        subc.contains("-D subscribe user-property sub yes"),
+        "{subc}"
+    );
+    click(&mut h, "Close");
+}
+
+/// Received messages: topic badge and payload each copy to the clipboard (with a check mark
+/// for feedback), the properties toggle only appears when there are properties, and the MQTT
+/// log exports as JSON or text, without what was cleared.
+#[test]
+fn messages_copy_and_the_log_exports_as_a_trace() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (port, roots) = broker::start(&rt, broker::Behavior::Accept);
+    let dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["c".into()]).unwrap();
+    let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+    let mut app = test_app(rt, &FakeAws::new(), roots, port);
+    app.load_certificate(&cert);
+    app.load_private_key(&key);
+    app.settings.mode = IdentityMode::ClientId;
+    app.settings.custom_client_id = "tracer".into();
+    let mut h = harness(app);
+    h.run_steps(2);
+    click_button(&mut h, &format!("{} Connect", icons::PLUG));
+    wait_until(&mut h, "the connection", |a| {
+        a.state == ConnectionState::Connected
+    });
+    h.state_mut().settings.subscribe_filter = "t/#".into();
+    h.run_steps(2);
+    click_button(&mut h, "Subscribe");
+    h.state_mut().settings.publish_topic = "t/1".into();
+    h.state_mut().publish_payload = "{\"t\": 21}".into();
+    h.run_steps(2);
+    click_containing(&mut h, "Send");
+    wait_until(&mut h, "the message", |a| !a.messages.is_empty());
+
+    // No properties on this message, so no properties toggle.
+    assert!(h.query_by_label_contains("User properties (").is_none());
+    let copied = |h: &Harness<'_, MqttApp>| -> Vec<String> {
+        h.output()
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // The payload lines up with the topic badge, on the left.
+    let topic = h.get_by_role_and_label(Role::Button, "Copy topic").rect();
+    let payload = h.get_by_label("{\"t\": 21}").rect();
+    assert!(
+        (payload.left() - topic.left()).abs() < 12.0,
+        "payload at {payload:?}, topic at {topic:?}"
+    );
+
+    // Clicking the topic badge copies it, with a toast as feedback. It has no copy button.
+    assert!(h.query_by_label("Copy topic").is_some());
+    h.get_by_role_and_label(Role::Button, "Copy topic").click();
+    h.step();
+    assert_eq!(copied(&h), ["t/1"]);
+    h.run_steps(1);
+    assert_eq!(
+        theme::toast_message(&h.ctx).as_deref(),
+        Some("Topic copied to the clipboard")
+    );
+    h.run_steps(2); // a new area sizes itself before it shows
+    h.get_by_label("Topic copied to the clipboard");
+    h.get_by_label("Copy payload").click();
+    h.step();
+    assert_eq!(copied(&h), ["{\"t\": 21}"]);
+    h.run_steps(1);
+    h.run_steps(2); // a new area sizes itself before it shows
+    h.get_by_label("Payload copied to the clipboard");
+
+    // Export the log as JSON and as text.
+    click_containing(&mut h, "Logs ");
+    let json_path = dir.path().join("trace.json");
+    h.state_mut().test_export_path = Some(json_path.clone());
+    click(&mut h, "Export…");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    let count = h.state().log.len();
+    assert_eq!(doc["packet_count"], count);
+    assert_eq!(doc["client_id"], "tracer");
+    let receive = doc["packets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["type"] == "RECEIVE")
+        .unwrap();
+    assert_eq!(receive["payload"], "{\"t\": 21}");
+    assert!(h.state().notice.as_deref().unwrap().contains("Exported"));
+    let text_path = dir.path().join("trace.txt");
+    h.state_mut().test_export_path = Some(text_path.clone());
+    click(&mut h, "Export…");
+    let text = std::fs::read_to_string(&text_path).unwrap();
+    assert!(text.contains("<- RECEIVE"), "{text}");
+    assert!(text.contains("    | {\"t\": 21}"), "{text}");
+
+    // Cleared history isn't exported; an empty log can't be exported.
+    for clear in h.get_all_by_label("Clear").collect::<Vec<_>>() {
+        clear.click();
+    }
+    h.run_steps(2);
+    std::fs::remove_file(&json_path).unwrap();
+    h.state_mut().test_export_path = Some(json_path.clone());
+    click(&mut h, "Export…");
+    assert!(!json_path.exists(), "nothing to export after clearing");
 }

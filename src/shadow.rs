@@ -185,6 +185,8 @@ pub struct Shadow {
     pub timestamp: Option<i64>,
     /// Set while an update is waiting for `update/accepted` or `update/rejected`.
     pub updating: bool,
+    /// When the pending update was sent, for its timeout.
+    pub update_sent: Option<Instant>,
     pub update_error: Option<String>,
 }
 
@@ -198,8 +200,22 @@ impl Shadow {
             version: None,
             timestamp: None,
             updating: false,
+            update_sent: None,
             update_error: None,
         }
+    }
+
+    /// Records that an update was just sent.
+    pub fn start_update(&mut self, now: Instant) {
+        self.updating = true;
+        self.update_sent = Some(now);
+        self.update_error = None;
+    }
+
+    fn finish_update(&mut self, error: Option<String>) {
+        self.updating = false;
+        self.update_sent = None;
+        self.update_error = error;
     }
 
     pub fn section(&self, section: Section) -> Option<&Value> {
@@ -303,14 +319,10 @@ impl Shadows {
                 shadow.delta = None;
             }
             Response::UpdateAccepted => {
-                shadow.updating = false;
-                shadow.update_error = None;
+                shadow.finish_update(None);
                 return Applied::Refresh(name);
             }
-            Response::UpdateRejected => {
-                shadow.updating = false;
-                shadow.update_error = Some(error_of(&doc).1);
-            }
+            Response::UpdateRejected => shadow.finish_update(Some(error_of(&doc).1)),
             Response::UpdateDocuments => {
                 if let Some(current) = doc.get("current") {
                     shadow.load(current, false);
@@ -327,19 +339,29 @@ impl Shadows {
         Applied::Handled
     }
 
-    /// Marks `get` requests unanswered for longer than `timeout` as failed.
-    pub fn expire(&mut self, now: Instant, timeout: Duration) {
+    /// Fails `get`s and updates unanswered for longer than `timeout`. Returns how many
+    /// failed, so the caller can re-establish the shadow subscription.
+    pub fn expire(&mut self, now: Instant, timeout: Duration) -> usize {
+        const NO_RESPONSE: &str = "No response from the Device Shadow service. Check that the \
+            device's policy allows receiving its $aws/things/…/shadow/ topics.";
+        let mut expired = 0;
         for shadow in self.items.values_mut() {
             if let Status::Loading(since) = shadow.status {
                 if now.duration_since(since) >= timeout {
-                    shadow.status = Status::Error(
-                        "No response. The device's policy may not allow subscribing to or \
-                         receiving its shadow topics."
-                            .into(),
-                    );
+                    shadow.status = Status::Error(NO_RESPONSE.into());
+                    expired += 1;
+                }
+            }
+            if let Some(sent) = shadow.update_sent {
+                if now.duration_since(sent) >= timeout {
+                    shadow.finish_update(Some(format!(
+                        "{NO_RESPONSE} The update may still have been applied."
+                    )));
+                    expired += 1;
                 }
             }
         }
+        expired
     }
 }
 
@@ -552,6 +574,31 @@ mod tests {
         assert_eq!(
             s.apply("$aws/things/t1/shadow/get/accepted", b"not json"),
             Applied::Handled
+        );
+    }
+
+    #[test]
+    fn unanswered_updates_time_out() {
+        let mut s = Shadows::new("t1");
+        let start = Instant::now();
+        s.get_or_insert(ShadowName::Classic).start_update(start);
+        assert_eq!(
+            s.expire(start + Duration::from_secs(1), RESPONSE_TIMEOUT),
+            0
+        );
+        assert!(s.items[&ShadowName::Classic].updating);
+        assert_eq!(s.expire(start + RESPONSE_TIMEOUT, RESPONSE_TIMEOUT), 1);
+        let c = &s.items[&ShadowName::Classic];
+        assert!(!c.updating, "Send update is usable again");
+        assert!(c
+            .update_error
+            .as_deref()
+            .unwrap()
+            .contains("may still have been applied"));
+        assert_eq!(
+            s.expire(start + RESPONSE_TIMEOUT * 2, RESPONSE_TIMEOUT),
+            0,
+            "only once"
         );
     }
 

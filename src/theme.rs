@@ -569,6 +569,16 @@ pub fn card_title(ui: &mut egui::Ui, text: &str, right: impl FnOnce(&mut egui::U
     });
 }
 
+/// "{count} {what}" in small muted text, under a card title (e.g. "2 active").
+pub fn count_caption(ui: &mut egui::Ui, count: usize, what: &str) {
+    let p = Palette::of(ui);
+    ui.label(
+        RichText::new(format!("{count} {what}"))
+            .small()
+            .color(p.muted),
+    );
+}
+
 /// A filled dot, for status indicators.
 pub fn dot(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(9.0), egui::Sense::hover());
@@ -659,6 +669,134 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, hover: &str, enabled: bool) ->
         .on_hover_text(hover);
     // Screen readers announce the purpose, not the glyph.
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, hover));
+    response
+}
+
+/// A compact, outlined icon button that fits in a single line of text, such as a log row.
+pub fn inline_icon_button(ui: &mut egui::Ui, icon: &str, hover: &str) -> egui::Response {
+    let p = Palette::of(ui);
+    let height = ui.text_style_height(&egui::TextStyle::Monospace);
+    let response = ui
+        .scope(|ui| {
+            // The theme's minimum interactive size would make it taller than the line.
+            ui.spacing_mut().interact_size = Vec2::splat(height);
+            ui.spacing_mut().button_padding = Vec2::new(3.0, 0.0);
+            ui.add(
+                egui::Button::new(RichText::new(icon).small())
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(egui::Stroke::new(1.0, p.border_strong))
+                    .corner_radius(CornerRadius::same(4))
+                    .min_size(Vec2::splat(height)),
+            )
+        })
+        .inner
+        .on_hover_text(hover);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, hover));
+    response
+}
+
+/// How long copy feedback (a button's check mark, the toast) stays up.
+const COPIED_FOR: f64 = 1.6;
+
+fn toast_id() -> egui::Id {
+    egui::Id::unique("copied_toast")
+}
+
+/// Copies `text` and shows "`what` copied to the clipboard" in a toast (see [`paint_toast`]).
+pub fn copy_to_clipboard(ctx: &egui::Context, text: String, what: &str) {
+    ctx.copy_text(text);
+    let now = ctx.input(|i| i.time);
+    let message = format!("{what} copied to the clipboard");
+    ctx.data_mut(|d| d.insert_temp(toast_id(), (message, now)));
+    ctx.request_repaint();
+}
+
+/// The current copy toast's message, if one is showing.
+pub fn toast_message(ctx: &egui::Context) -> Option<String> {
+    let now = ctx.input(|i| i.time);
+    ctx.data(|d| d.get_temp::<(String, f64)>(toast_id()))
+        .filter(|(_, at)| now - at < COPIED_FOR)
+        .map(|(message, _)| message)
+}
+
+/// Draws the copy toast near the bottom of the window, above everything (dialogs included).
+/// Call once per frame, after the rest of the UI.
+pub fn paint_toast(ctx: &egui::Context) {
+    let Some(message) = toast_message(ctx) else {
+        return;
+    };
+    let tokens = tokens(ctx);
+    let colors = tokens.colors(ctx.theme());
+    egui::Area::new(egui::Id::unique("copied_toast_area"))
+        .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -32.0))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(colors.glass_strong.0)
+                .stroke(egui::Stroke::new(1.0, colors.glass_border.0))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(12, 6))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 14,
+                    spread: 0,
+                    color: colors.shadow.0,
+                })
+                .show(ui, |ui| {
+                    let p = Palette::of(ui);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(crate::icons::CHECK).color(p.ok));
+                        ui.label(RichText::new(message).small());
+                    });
+                });
+        });
+    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+}
+
+/// A badge that copies `text` when clicked (with the toast as feedback).
+pub fn copyable_pill(ui: &mut egui::Ui, text: &str, color: Color32, what: &str) -> egui::Response {
+    let response = pill(ui, text, color)
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("Click to copy the {}", what.to_lowercase()));
+    let label = format!("Copy {}", what.to_lowercase());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
+    if response.clicked() {
+        copy_to_clipboard(ui.ctx(), text.to_owned(), what);
+    }
+    response
+}
+
+/// An outlined clipboard button that copies `text`, then briefly shows a check mark and the
+/// toast. `id` must be unique and stable for the thing being copied; `what` names it in the
+/// toast ("Payload copied to the clipboard").
+pub fn copy_button(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    text: impl FnOnce() -> String,
+    what: &str,
+    hover: &str,
+) -> egui::Response {
+    let id = ui.make_persistent_id(("copy_button", id));
+    let now = ui.input(|i| i.time);
+    let copied_at: Option<f64> = ui.data(|d| d.get_temp(id));
+    let recent = copied_at.is_some_and(|t| now - t < COPIED_FOR);
+    let icon = if recent {
+        crate::icons::CHECK
+    } else {
+        crate::icons::COPY
+    };
+    let response = inline_icon_button(ui, icon, hover);
+    if response.clicked() {
+        copy_to_clipboard(ui.ctx(), text(), what);
+        ui.data_mut(|d| d.insert_temp(id, now));
+    }
+    if recent {
+        // Repaint when the check mark should turn back into the clipboard.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(COPIED_FOR));
+    }
     response
 }
 

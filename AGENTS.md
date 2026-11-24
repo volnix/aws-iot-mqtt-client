@@ -31,6 +31,8 @@ python3 scripts/generate_notice.py --check   # only fails if dependencies change
     (`dirs`) was removed for this reason.
   - After any dependency change, run `python3 scripts/generate_notice.py` and commit `NOTICE`.
 - **MSRV** is `rust-version` in `Cargo.toml` (set by egui). Don't use newer std APIs.
+- **eframe features:** default features are off, so list what's needed. `clipboard` is
+  required for copy and paste; without it `ctx.copy_text` silently does nothing.
 - **AWS SDK features:** keep `default-features = false` on the `aws-sdk-*` crates. Their
   default `rustls` feature brings back a legacy TLS stack with security advisories.
 - **Advisories:** `cargo deny check` must pass. Only add a `deny.toml` ignore after confirming
@@ -96,6 +98,9 @@ python3 scripts/generate_notice.py --check   # only fails if dependencies change
     `egui::Role`.
   - Use `wait_until` for background results, never fixed sleeps.
   - Keep clicked widgets inside the harness window (1400×1000). Off-screen clicks silently miss.
+  - Widgets scrolled out of a `ScrollArea` still report a rect. Call `node.scroll_to_me()`
+    and step before clicking them.
+  - A modal needs a few `run_steps` after opening before its contents are in the tree.
 - **MQTT protocol versions:** `src/mqtt.rs` has separate MQTT 3.1.1 (`rumqttc`) and MQTT 5
   (`rumqttc::v5`) drivers. Their `QoS`, `Packet`, and error types are distinct. Change both,
   and keep `unreachable_endpoint_reports_error` covering both.
@@ -116,6 +121,9 @@ python3 scripts/generate_notice.py --check   # only fails if dependencies change
 - **Release packaging:** `.github/workflows/release.yml` packages through `scripts/package.py`.
   Change packaging in the script, not the workflow, and test it locally with
   `python3 scripts/package.py`.
+- **App icon:** `assets/icon/icon.png` is the source. After changing it, run
+  `python3 scripts/make_icons.py` (macOS) and commit `assets/icon/icon.ico` too. `build.rs`
+  embeds the `.ico` on Windows only, and can't be tested on macOS: watch the Windows CI job.
 - **Signing secrets:** never expose them to a step that compiles. Dependency build scripts
   run during `cargo build`. The release workflow builds first, then signs in a separate step
   with `package.py --skip-build`.

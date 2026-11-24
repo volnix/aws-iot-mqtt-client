@@ -253,14 +253,19 @@ pub mod broker {
 
     type ShadowStore = std::collections::HashMap<String, (serde_json::Value, u64)>;
 
-    /// A broker-to-client PUBLISH at QoS 1 (packet ID 1).
-    fn publish_packet(topic: &str, payload: &[u8], v5: bool) -> Vec<u8> {
+    /// A broker-to-client PUBLISH at QoS 1 (packet ID 1). For MQTT 5, `properties` is a raw
+    /// properties block (length included), or empty for none.
+    fn publish_packet(topic: &str, payload: &[u8], v5: bool, properties: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&(topic.len() as u16).to_be_bytes());
         b.extend_from_slice(topic.as_bytes());
         b.extend_from_slice(&[0x00, 0x01]);
         if v5 {
-            b.push(0x00);
+            if properties.is_empty() {
+                b.push(0x00);
+            } else {
+                b.extend_from_slice(properties);
+            }
         }
         b.extend_from_slice(payload);
         packet(0x32, &b)
@@ -272,8 +277,7 @@ pub mod broker {
         store: &mut ShadowStore,
         topic: &str,
         payload: &[u8],
-        v5: bool,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(String, Vec<u8>)> {
         use serde_json::{json, Value};
         if !topic.starts_with("$aws/things/") || !topic.contains("/shadow") {
             return None;
@@ -290,18 +294,16 @@ pub mod broker {
                     }
                     let doc =
                         json!({ "state": state, "version": version, "timestamp": 1_700_000_000 });
-                    publish_packet(
-                        &format!("{prefix}/get/accepted"),
-                        doc.to_string().as_bytes(),
-                        v5,
+                    (
+                        format!("{prefix}/get/accepted"),
+                        doc.to_string().into_bytes(),
                     )
                 }
                 None => {
                     let err = json!({ "code": 404, "message": "No shadow exists with name" });
-                    publish_packet(
-                        &format!("{prefix}/get/rejected"),
-                        err.to_string().as_bytes(),
-                        v5,
+                    (
+                        format!("{prefix}/get/rejected"),
+                        err.to_string().into_bytes(),
                     )
                 }
             }),
@@ -309,27 +311,43 @@ pub mod broker {
                 let request: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
                 let Some(update) = request.get("state").and_then(Value::as_object) else {
                     let err = json!({ "code": 400, "message": "Missing required node: state" });
-                    return Some(publish_packet(
-                        &format!("{prefix}/update/rejected"),
-                        err.to_string().as_bytes(),
-                        v5,
+                    return Some((
+                        format!("{prefix}/update/rejected"),
+                        err.to_string().into_bytes(),
                     ));
                 };
                 let entry = store.entry(prefix.to_owned()).or_insert((json!({}), 0));
+                // Like the service: merge objects, and delete attributes set to null.
+                fn merge(target: &mut Value, update: &Value) {
+                    match (target.as_object_mut(), update.as_object()) {
+                        (Some(t), Some(u)) => {
+                            for (k, v) in u {
+                                if v.is_null() {
+                                    t.remove(k);
+                                } else if v.is_object() && t.get(k).is_some_and(Value::is_object) {
+                                    merge(t.get_mut(k).unwrap(), v);
+                                } else {
+                                    t.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        _ => *target = update.clone(),
+                    }
+                }
                 for (section, value) in update {
+                    let state = entry.0.as_object_mut().unwrap();
                     if value.is_null() {
-                        entry.0.as_object_mut().unwrap().remove(section);
+                        state.remove(section);
                     } else {
-                        entry.0[section] = value.clone();
+                        merge(state.entry(section.clone()).or_insert(json!({})), value);
                     }
                 }
                 entry.1 += 1;
                 let accepted =
                     json!({ "state": update, "version": entry.1, "timestamp": 1_700_000_100 });
-                Some(publish_packet(
-                    &format!("{prefix}/update/accepted"),
-                    accepted.to_string().as_bytes(),
-                    v5,
+                Some((
+                    format!("{prefix}/update/accepted"),
+                    accepted.to_string().into_bytes(),
                 ))
             }
             _ => None,
@@ -429,15 +447,48 @@ pub mod broker {
     }
 
     /// Accepts one client and serves it until it disconnects.
+    /// Topic filters in a SUBSCRIBE (each followed by an options byte) or UNSUBSCRIBE body.
+    fn filters(body: &[u8], v5: bool, options: bool) -> Vec<String> {
+        let mut at = 2; // packet ID
+        if v5 {
+            at = skip_properties(body, at);
+        }
+        let mut out = Vec::new();
+        while at + 2 <= body.len() {
+            let len = u16::from_be_bytes([body[at], body[at + 1]]) as usize;
+            at += 2;
+            out.push(String::from_utf8_lossy(&body[at..at + len]).into_owned());
+            at += len + usize::from(options);
+        }
+        out
+    }
+
+    /// Accepts clients until the runtime shuts down. Shadows persist across connections.
     async fn serve(
         listener: TcpListener,
         acceptor: tokio_rustls::TlsAcceptor,
         behavior: Behavior,
-        mut shadows: ShadowStore,
+        shadows: ShadowStore,
     ) {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut s = acceptor.accept(tcp).await.unwrap();
+        let shadows = Arc::new(std::sync::Mutex::new(shadows));
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, shadows) = (acceptor.clone(), shadows.clone());
+            tokio::spawn(async move {
+                if let Ok(stream) = acceptor.accept(tcp).await {
+                    serve_client(stream, behavior, shadows).await;
+                }
+            });
+        }
+    }
+
+    async fn serve_client(
+        mut s: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        behavior: Behavior,
+        shadows: Arc<std::sync::Mutex<ShadowStore>>,
+    ) {
         let mut v5 = false;
+        // Like a real broker, messages only go to matching subscriptions.
+        let mut subscriptions: Vec<String> = Vec::new();
         while let Some((header, body)) = read_packet(&mut s).await {
             let pkid = |at: usize| [body[at], body[at + 1]];
             let reply = match header >> 4 {
@@ -454,7 +505,12 @@ pub mod broker {
                         0x00
                     };
                     let mut out = if v5 {
-                        packet(0x20, &[0x00, code, 0x00])
+                        // One User Property, broker=fake, so clients can show CONNACK properties.
+                        let mut b = vec![0x00, code, 15, 0x26, 0, 6];
+                        b.extend_from_slice(b"broker");
+                        b.extend_from_slice(&[0, 4]);
+                        b.extend_from_slice(b"fake");
+                        packet(0x20, &b)
                     } else {
                         packet(0x20, &[0x00, code])
                     };
@@ -479,9 +535,12 @@ pub mod broker {
                     if qos > 0 {
                         at += 2;
                     }
+                    let properties_start = at;
                     if v5 {
                         at = skip_properties(&body, at);
                     }
+                    // Forwarded to subscribers, as AWS IoT does with User Properties.
+                    let properties = body[properties_start..at].to_vec();
                     let payload = &body[at..];
                     let mut out = match (qos, id) {
                         (1, Some(id)) => packet(0x40, &id),
@@ -489,15 +548,23 @@ pub mod broker {
                         _ => Vec::new(),
                     };
                     let topic = String::from_utf8_lossy(topic).into_owned();
-                    match shadow_reply(&mut shadows, &topic, payload, v5) {
-                        Some(reply) => out.extend(reply),
-                        None => out.extend(publish_packet(&topic, payload, v5)),
+                    let reply = shadow_reply(&mut shadows.lock().unwrap(), &topic, payload);
+                    let (topic, payload, properties) = match reply {
+                        Some((topic, payload)) => (topic, payload, Vec::new()),
+                        None => (topic, payload.to_vec(), properties),
+                    };
+                    if subscriptions
+                        .iter()
+                        .any(|f| crate::validators::topic_matches(f, &topic))
+                    {
+                        out.extend(publish_packet(&topic, &payload, v5, &properties));
                     }
                     out
                 }
                 6 => packet(0x70, &pkid(0)), // PUBREL → PUBCOMP
                 8 => {
                     // SUBSCRIBE → SUBACK granting QoS 1.
+                    subscriptions.extend(filters(&body, v5, true));
                     let mut b = pkid(0).to_vec();
                     if v5 {
                         b.push(0x00);
@@ -507,6 +574,8 @@ pub mod broker {
                 }
                 10 => {
                     // UNSUBSCRIBE → UNSUBACK.
+                    let gone = filters(&body, v5, false);
+                    subscriptions.retain(|f| !gone.contains(f));
                     let mut b = pkid(0).to_vec();
                     if v5 {
                         b.extend_from_slice(&[0x00, 0x00]);

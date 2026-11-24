@@ -89,6 +89,7 @@ mod tests {
             include_str!("app.rs"),
             include_str!("app/simulator.rs"),
             include_str!("app/shadows.rs"),
+            include_str!("app/cli_dialog.rs"),
             include_str!("theme.rs"),
         ]
         .concat();

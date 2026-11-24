@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-24
+
+MQTT 5 User Properties, a form editor for shadows, command-line export, shareable traces, an
+app icon, and fixes for copying and for shadow updates that never finished.
+
+### Added
+
+- MQTT 5 User Properties.
+  - **Sent:** add them to CONNECT and the last will (under **Advanced**), to PUBLISH (under
+    the composer), and to SUBSCRIBE and UNSUBSCRIBE (under the subscribe field).
+  - **Shown:** on received messages, and in the MQTT log for every broker packet that carries
+    them (CONNACK, RECEIVE, PUBACK, PUBREC, PUBREL, PUBCOMP, SUBACK, UNSUBACK, DISCONNECT,
+    AUTH).
+  - **Copied:** they're included in copied `mosquitto_pub`/`mosquitto_sub` commands as `-D`
+    options.
+  - **Not supported:** DISCONNECT and the acknowledgements the client sends, because the MQTT
+    library doesn't allow setting their properties.
+- Sent PUBLISH and SUBSCRIBE rows in the MQTT log have a copy button that shows the
+  equivalent `mosquitto_pub` or `mosquitto_sub` command, with the full topic, QoS, retain flag,
+  and payload, for macOS/Linux or PowerShell.
+- **Export…** in the MQTT log saves the log as a trace, to share with someone. It's saved as
+  JSON (full topics, payloads, and User Properties) or as text that reads like the log, and
+  includes only what hasn't been cleared.
+- On received messages, click the topic badge to copy it. The payload has a copy button.
+- Copying anything shows a short "copied to the clipboard" confirmation.
+- An app icon, shown in the Dock, taskbar, and window, on the Windows `.exe`, and on the
+  macOS disk image.
+
+### Changed
+
+- The shadow editor has a **Fields** mode, now the default. Each field has a type (text,
+  number, true/false, group, list, or null) and a matching input, and groups nest. Removing
+  a field deletes it from the shadow when you send, with undo. Problems such as a bad number
+  or a duplicate name are shown inline. **JSON** mode is still one click away, and edits
+  carry over in both directions. True/false fields use **True** and **False** radio buttons.
+- When you're not connected, the **Shadows** tab offers a short connect form (account, Thing,
+  and certificate), and you can reconnect from the shadow list after disconnecting.
+- Received messages show the topic as a badge, then the payload, then a **User properties**
+  toggle (only when the message has any).
+- Messages the broker delivers are logged as **RECEIVE**, so they're easy to tell apart from
+  the PUBLISH packets the app sends.
+- Copy buttons in the MQTT log are outlined clipboard buttons, so they read as buttons.
+- Counts appear under the title as "2 active" (Subscriptions, Shadows) instead of beside it,
+  and the Shadows tab no longer shows a count.
+- Shorter error messages. A profile that doesn't exist, missing credentials, and other
+  credential failures each get a one-line message with a specific next step. Long technical
+  details are behind a **Details** toggle.
+
+### Fixed
+
+- Copying didn't reach the system clipboard (including ⌘C/Ctrl+C in text fields), because
+  clipboard support wasn't built in.
+- A shadow update could spin forever when no response came back. Updates now time out after
+  10 seconds, and the app re-subscribes to the shadow topics and reloads the shadows once.
+- The shadow-topic subscription is marked **Used by Shadows** in the Subscriptions list and
+  can't be unsubscribed there, since that silently broke the Shadows tab.
+
 ## [1.1.0] - 2026-11-22
 
 ### Fixed

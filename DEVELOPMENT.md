@@ -49,6 +49,17 @@ python3 scripts/package.py --macos-universal  # macOS: one app for Apple silicon
 The archive and its `.sha256` file go to `dist/`. On macOS you get a `.dmg` and a zipped `.app`. A universal
 build needs both targets: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
 
+### App icon
+
+The icon's source is `assets/icon/icon.png`, a 1024×1024 PNG on the macOS icon grid.
+`scripts/draw_icon.py` draws the current design.
+- **Runtime:** the app loads `icon.png` for its window, taskbar, and Dock icon.
+- **macOS:** `scripts/package.py` builds `AppIcon.icns` for the app bundle and the disk image.
+- **Windows:** `build.rs` embeds `assets/icon/icon.ico` in the `.exe`.
+
+To change it, replace `icon.png` (or edit and rerun `draw_icon.py`). Then run
+`python3 scripts/make_icons.py` on a Mac to rebuild `icon.ico`, and commit both files.
+
 ## Develop with hot reload
 
 Run the development loop from the repository root:
@@ -131,7 +142,11 @@ pitfalls.
 | `src/app.rs` | egui UI; background work runs on a tokio runtime and reports back over a channel |
 | `src/app/simulator.rs` | The Policy simulator tab |
 | `src/app/shadows.rs` | The Shadows tab: loads the connected Thing's shadows and sends updates |
+| `src/trace_export.rs` | Exports the MQTT log as a JSON or text trace |
+| `src/cli_export.rs` | `mosquitto_pub`/`mosquitto_sub` commands for a publish or subscribe, quoted for POSIX shells or PowerShell |
+| `src/app/cli_dialog.rs` | The "Copy as mosquitto_pub/sub" dialog |
 | `src/shadow.rs` | Device Shadow topics, payloads, response handling, and delta (no UI or network) |
+| `src/shadow_fields.rs` | The shadow form editor's typed fields: conversion to and from JSON, and validation |
 | `src/policy_sim.rs` | Offline policy evaluation for MQTT operations (no UI or AWS dependencies) |
 | `src/aws.rs` | Profile discovery, credential resolution, logged IoT/STS/data-plane calls (including listing named shadows), endpoint discovery |
 | `src/provision.rs` | Certificate creation workflow, default policy template, local credential storage |
@@ -144,7 +159,8 @@ pitfalls.
 | `src/validators.rs` | Client ID, endpoint, and topic validation |
 | `src/error.rs` | Categorized errors with details and suggested actions |
 | `src/paths.rs` | Platform home and cache directories |
-| `scripts/` | `dev.py` (rebuild and relaunch on save), `package.py` (release archives), `generate_notice.py` |
+| `scripts/` | `dev.py` (rebuild and relaunch on save), `package.py` (release archives), `generate_notice.py`, `draw_icon.py` and `make_icons.py` (app icon) |
+| `build.rs` | Embeds the icon in the Windows `.exe` |
 | `assets/` | Amazon Root CA 1–4 (TLS trust anchors, plus the Mozilla root set for custom domains) and `theme.json` design tokens |
 
 ## Releasing

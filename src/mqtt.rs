@@ -23,7 +23,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::error::{categorize_message, AppError, ErrorCategory};
-use crate::packet_log::{format_payload, Direction, PacketLogEntry};
+use crate::packet_log::{format_payload, Direction, PacketLogEntry, Replay};
 use crate::validators::{
     validate_client_id, validate_endpoint, validate_publish_topic, validate_topic_filter,
 };
@@ -100,6 +100,18 @@ impl ConnectionState {
     }
 }
 
+/// MQTT 5 User Properties: name/value string pairs, in order (names may repeat).
+pub type UserProperties = Vec<(String, String)>;
+
+/// `[k=v, k2=v2]` for logs; empty when there are none.
+pub fn describe_properties(props: &[(String, String)]) -> String {
+    if props.is_empty() {
+        return String::new();
+    }
+    let pairs: Vec<String> = props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!(" user_properties=[{}]", pairs.join(", "))
+}
+
 /// Message the broker publishes on the client's behalf if it disconnects ungracefully.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastWill {
@@ -107,6 +119,8 @@ pub struct LastWill {
     pub payload: Vec<u8>,
     pub qos: u8,
     pub retain: bool,
+    /// MQTT 5 only.
+    pub user_properties: UserProperties,
 }
 
 #[derive(Clone)]
@@ -122,6 +136,8 @@ pub struct ConnectionConfig {
     /// MQTT 5 only: seconds the broker keeps the session after disconnect. `None` = not sent.
     pub session_expiry_secs: Option<u32>,
     pub last_will: Option<LastWill>,
+    /// MQTT 5 only: sent in CONNECT.
+    pub user_properties: UserProperties,
 }
 
 impl std::fmt::Debug for ConnectionConfig {
@@ -175,18 +191,25 @@ impl ConnectionConfig {
             self.clean_session,
             KEEP_ALIVE.as_secs()
         );
-        if self.version == MqttVersion::V5 {
+        let v5 = self.version == MqttVersion::V5;
+        if v5 {
             if let Some(exp) = self.session_expiry_secs {
                 s.push_str(&format!(" session_expiry={exp}s"));
             }
+            s.push_str(&describe_properties(&self.user_properties));
         }
         if let Some(w) = &self.last_will {
             s.push_str(&format!(
-                " will(topic={} qos={} retain={} payload={})",
+                " will(topic={} qos={} retain={} payload={}{})",
                 w.topic,
                 w.qos,
                 w.retain,
-                format_payload(&w.payload, 64)
+                format_payload(&w.payload, 64),
+                if v5 {
+                    describe_properties(&w.user_properties)
+                } else {
+                    String::new()
+                }
             ));
         }
         s.push_str(&format!(" ({})", self.version.label()));
@@ -201,6 +224,8 @@ pub struct ReceivedMessage {
     pub payload: Vec<u8>,
     pub qos: u8,
     pub retain: bool,
+    /// MQTT 5 User Properties sent with the message.
+    pub user_properties: UserProperties,
 }
 
 #[derive(Debug, Clone)]
@@ -242,38 +267,73 @@ enum Client {
 }
 
 impl Client {
+    /// User properties are MQTT 5 only; the 3.1.1 client ignores them.
     fn try_publish(
         &self,
         topic: &str,
         qos: u8,
         retain: bool,
         payload: Vec<u8>,
+        props: &[(String, String)],
     ) -> Result<(), String> {
+        use rumqttc::v5::mqttbytes::v5::PublishProperties;
         match self {
             Client::V4(c) => c
                 .try_publish(topic, qos_v4(qos), retain, payload)
                 .map_err(|e| e.to_string()),
-            Client::V5(c) => c
+            Client::V5(c) if props.is_empty() => c
                 .try_publish(topic, qos_v5(qos), retain, payload)
                 .map_err(|e| e.to_string()),
+            Client::V5(c) => {
+                let properties = PublishProperties {
+                    user_properties: props.to_vec(),
+                    ..Default::default()
+                };
+                c.try_publish_with_properties(topic, qos_v5(qos), retain, payload, properties)
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 
-    fn try_subscribe(&self, filter: &str, qos: u8) -> Result<(), String> {
+    fn try_subscribe(
+        &self,
+        filter: &str,
+        qos: u8,
+        props: &[(String, String)],
+    ) -> Result<(), String> {
+        use rumqttc::v5::mqttbytes::v5::SubscribeProperties;
         match self {
             Client::V4(c) => c
                 .try_subscribe(filter, qos_v4(qos))
                 .map_err(|e| e.to_string()),
-            Client::V5(c) => c
+            Client::V5(c) if props.is_empty() => c
                 .try_subscribe(filter, qos_v5(qos))
                 .map_err(|e| e.to_string()),
+            Client::V5(c) => {
+                let properties = SubscribeProperties {
+                    id: None,
+                    user_properties: props.to_vec(),
+                };
+                c.try_subscribe_with_properties(filter, qos_v5(qos), properties)
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 
-    fn try_unsubscribe(&self, filter: &str) -> Result<(), String> {
+    fn try_unsubscribe(&self, filter: &str, props: &[(String, String)]) -> Result<(), String> {
+        use rumqttc::v5::mqttbytes::v5::UnsubscribeProperties;
         match self {
             Client::V4(c) => c.try_unsubscribe(filter).map_err(|e| e.to_string()),
-            Client::V5(c) => c.try_unsubscribe(filter).map_err(|e| e.to_string()),
+            Client::V5(c) if props.is_empty() => {
+                c.try_unsubscribe(filter).map_err(|e| e.to_string())
+            }
+            Client::V5(c) => {
+                let properties = UnsubscribeProperties {
+                    user_properties: props.to_vec(),
+                };
+                c.try_unsubscribe_with_properties(filter, properties)
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -285,6 +345,9 @@ impl Client {
     }
 }
 
+/// Queued requests: the log description, and the full request for PUBLISH and SUBSCRIBE.
+type Pending = Mutex<VecDeque<(String, Option<Replay>)>>;
+
 /// Shared by both protocol drivers: sends events and tracks queued request descriptions.
 #[derive(Clone)]
 struct Reporter {
@@ -292,7 +355,7 @@ struct Reporter {
     sink: EventSink,
     /// Descriptions of queued PUBLISH/SUBSCRIBE/UNSUBSCRIBE requests, consumed in FIFO order when
     /// the event loop reports them sent (the request channel preserves ordering).
-    pending: Arc<Mutex<VecDeque<String>>>,
+    pending: Arc<Pending>,
     closing: Arc<AtomicBool>,
 }
 
@@ -302,13 +365,21 @@ impl Reporter {
     }
 
     fn packet(&self, direction: Direction, kind: String, details: String) {
-        (self.sink)(
-            self.id,
-            MqttEvent::Packet(PacketLogEntry::new(direction, kind, details)),
-        );
+        self.log(PacketLogEntry::new(direction, kind, details));
     }
 
-    fn message(&self, topic: String, payload: Vec<u8>, qos: u8, retain: bool) {
+    fn log(&self, entry: PacketLogEntry) {
+        (self.sink)(self.id, MqttEvent::Packet(entry));
+    }
+
+    fn message(
+        &self,
+        topic: String,
+        payload: Vec<u8>,
+        qos: u8,
+        retain: bool,
+        user_properties: UserProperties,
+    ) {
         (self.sink)(
             self.id,
             MqttEvent::Message(ReceivedMessage {
@@ -317,6 +388,7 @@ impl Reporter {
                 payload,
                 qos,
                 retain,
+                user_properties,
             }),
         );
     }
@@ -324,8 +396,8 @@ impl Reporter {
     /// Logs an outgoing packet. Returns true for DISCONNECT, which ends the session: it has
     /// already been flushed to the socket when rumqttc reports it.
     fn outgoing(&self, out: &Outgoing) -> bool {
-        let (kind, details) = describe_outgoing(out, &self.pending);
-        self.packet(Direction::Sent, kind, details);
+        let (kind, details, replay) = describe_outgoing(out, &self.pending);
+        self.log(PacketLogEntry::new(Direction::Sent, kind, details).with_replay(replay));
         if matches!(out, Outgoing::Disconnect) {
             self.state(ConnectionState::Disconnected, None);
             return true;
@@ -446,44 +518,78 @@ impl Connection {
         });
     }
 
+    /// User properties for this protocol version: MQTT 3.1.1 has none, so they're dropped.
+    fn props<'a>(&self, props: &'a [(String, String)]) -> &'a [(String, String)] {
+        match self.version {
+            MqttVersion::V5 => props,
+            MqttVersion::V311 => &[],
+        }
+    }
+
+    /// Publishes a message. `user_properties` are sent with MQTT 5 and ignored with 3.1.1.
     pub fn publish(
         &self,
         topic: &str,
         qos: u8,
         retain: bool,
         payload: Vec<u8>,
+        user_properties: &[(String, String)],
     ) -> Result<(), AppError> {
         validate_publish_topic(topic).map_err(AppError::configuration)?;
+        let props = self.props(user_properties);
         let description = format!(
-            "topic={topic} qos={qos} retain={retain} payload={}",
+            "topic={topic} qos={qos} retain={retain}{} payload={}",
+            describe_properties(props),
             format_payload(&payload, LOG_PAYLOAD_MAX)
         );
-        self.enqueue(description, || {
-            self.client.try_publish(topic, qos, retain, payload)
+        let replay = Replay::publish(topic, qos, retain, &payload, props);
+        self.enqueue(description, replay, || {
+            self.client.try_publish(topic, qos, retain, payload, props)
         })
     }
 
-    pub fn subscribe(&self, filter: &str, qos: u8) -> Result<(), AppError> {
+    /// Subscribes. `user_properties` are sent with MQTT 5 and ignored with 3.1.1.
+    pub fn subscribe(
+        &self,
+        filter: &str,
+        qos: u8,
+        user_properties: &[(String, String)],
+    ) -> Result<(), AppError> {
         validate_topic_filter(filter).map_err(AppError::configuration)?;
-        self.enqueue(format!("filter={filter} qos={qos}"), || {
-            self.client.try_subscribe(filter, qos)
+        let props = self.props(user_properties);
+        let replay = Some(Replay::Subscribe {
+            filter: filter.to_owned(),
+            qos,
+            user_properties: props.to_vec(),
+        });
+        let description = format!("filter={filter} qos={qos}{}", describe_properties(props));
+        self.enqueue(description, replay, || {
+            self.client.try_subscribe(filter, qos, props)
         })
     }
 
-    pub fn unsubscribe(&self, filter: &str) -> Result<(), AppError> {
-        self.enqueue(format!("filter={filter}"), || {
-            self.client.try_unsubscribe(filter)
+    /// Unsubscribes. `user_properties` are sent with MQTT 5 and ignored with 3.1.1.
+    pub fn unsubscribe(
+        &self,
+        filter: &str,
+        user_properties: &[(String, String)],
+    ) -> Result<(), AppError> {
+        let props = self.props(user_properties);
+        let description = format!("filter={filter}{}", describe_properties(props));
+        self.enqueue(description, None, || {
+            self.client.try_unsubscribe(filter, props)
         })
     }
 
     fn enqueue(
         &self,
         description: String,
+        replay: Option<Replay>,
         send: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), AppError> {
         // Hold the lock across the send so descriptions stay in the same order as requests.
         let mut pending = self.reporter.pending.lock().expect("pending lock poisoned");
-        pending.push_back(description);
+        pending.push_back((description, replay));
         send().map_err(|e| {
             pending.pop_back();
             AppError::network("Could not queue MQTT request").with_details(e)
@@ -507,13 +613,30 @@ fn v5_client(
         .set_connection_timeout(CONNECT_TIMEOUT.as_secs())
         .set_session_expiry_interval(config.session_expiry_secs)
         .set_transport(Transport::Tls(TlsConfiguration::Rustls(tls)));
+    if !config.user_properties.is_empty() {
+        // Added to the CONNECT properties that the session expiry above already set up.
+        let mut properties = options.connect_properties().unwrap_or_default();
+        properties.user_properties = config.user_properties.clone();
+        options.set_connect_properties(properties);
+    }
     if let Some(w) = &config.last_will {
+        let properties = (!w.user_properties.is_empty()).then(|| {
+            rumqttc::v5::mqttbytes::v5::LastWillProperties {
+                delay_interval: None,
+                payload_format_indicator: None,
+                message_expiry_interval: None,
+                content_type: None,
+                response_topic: None,
+                correlation_data: None,
+                user_properties: w.user_properties.clone(),
+            }
+        });
         options.set_last_will(rumqttc::v5::mqttbytes::v5::LastWill::new(
             &w.topic,
             w.payload.clone(),
             qos_v5(w.qos),
             w.retain,
-            None,
+            properties,
         ));
     }
     rumqttc::v5::AsyncClient::new(options, 64)
@@ -539,7 +662,21 @@ async fn run_v5(mut eventloop: rumqttc::v5::EventLoop, r: Reporter) {
         match polled {
             Ok(Event::Incoming(packet)) => {
                 let (kind, details) = describe_incoming_v5(&packet);
-                r.packet(Direction::Received, kind, details);
+                // A received message keeps its full content, for exported traces.
+                let message = match &packet {
+                    Packet::Publish(p) => Replay::publish(
+                        &String::from_utf8_lossy(&p.topic),
+                        p.qos as u8,
+                        p.retain,
+                        &p.payload,
+                        p.properties
+                            .as_ref()
+                            .map(|p| p.user_properties.as_slice())
+                            .unwrap_or_default(),
+                    ),
+                    _ => None,
+                };
+                r.log(PacketLogEntry::new(Direction::Received, kind, details).with_replay(message));
                 match packet {
                     Packet::ConnAck(_) if !connected => {
                         connected = true;
@@ -550,6 +687,10 @@ async fn run_v5(mut eventloop: rumqttc::v5::EventLoop, r: Reporter) {
                         p.payload.to_vec(),
                         p.qos as u8,
                         p.retain,
+                        p.properties
+                            .as_ref()
+                            .map(|p| p.user_properties.clone())
+                            .unwrap_or_default(),
                     ),
                     _ => {}
                 }
@@ -567,43 +708,86 @@ async fn run_v5(mut eventloop: rumqttc::v5::EventLoop, r: Reporter) {
     }
 }
 
+/// Kind and details for a received packet. An incoming PUBLISH is logged as RECEIVE, to tell
+/// it apart from the app's own PUBLISH.
 fn describe_incoming_v5(packet: &rumqttc::v5::mqttbytes::v5::Packet) -> (String, String) {
     use rumqttc::v5::mqttbytes::v5::Packet;
+    // Every packet that can carry User Properties shows them.
+    macro_rules! props {
+        ($p:expr) => {
+            $p.as_ref()
+                .map(|p| describe_properties(&p.user_properties))
+                .unwrap_or_default()
+        };
+    }
     match packet {
         Packet::ConnAck(a) => (
             "CONNACK".into(),
-            format!("reason={:?} session_present={}", a.code, a.session_present),
+            format!(
+                "reason={:?} session_present={}{}",
+                a.code,
+                a.session_present,
+                props!(a.properties)
+            ),
         ),
         Packet::Publish(p) => (
-            "PUBLISH".into(),
+            "RECEIVE".into(),
             format!(
-                "topic={} qos={} retain={} pkid={} payload={}",
+                "topic={} qos={} retain={} pkid={}{} payload={}",
                 String::from_utf8_lossy(&p.topic),
                 p.qos as u8,
                 p.retain,
                 p.pkid,
+                props!(p.properties),
                 format_payload(&p.payload, LOG_PAYLOAD_MAX)
             ),
         ),
         Packet::PubAck(a) => (
             "PUBACK".into(),
-            format!("pkid={} reason={:?}", a.pkid, a.reason),
+            format!(
+                "pkid={} reason={:?}{}",
+                a.pkid,
+                a.reason,
+                props!(a.properties)
+            ),
         ),
-        Packet::PubRec(a) => ("PUBREC".into(), format!("pkid={}", a.pkid)),
-        Packet::PubRel(a) => ("PUBREL".into(), format!("pkid={}", a.pkid)),
-        Packet::PubComp(a) => ("PUBCOMP".into(), format!("pkid={}", a.pkid)),
+        Packet::PubRec(a) => (
+            "PUBREC".into(),
+            format!("pkid={}{}", a.pkid, props!(a.properties)),
+        ),
+        Packet::PubRel(a) => (
+            "PUBREL".into(),
+            format!("pkid={}{}", a.pkid, props!(a.properties)),
+        ),
+        Packet::PubComp(a) => (
+            "PUBCOMP".into(),
+            format!("pkid={}{}", a.pkid, props!(a.properties)),
+        ),
         Packet::SubAck(a) => (
             "SUBACK".into(),
-            format!("pkid={} codes={:?}", a.pkid, a.return_codes),
+            format!(
+                "pkid={} codes={:?}{}",
+                a.pkid,
+                a.return_codes,
+                props!(a.properties)
+            ),
         ),
         Packet::UnsubAck(a) => (
             "UNSUBACK".into(),
-            format!("pkid={} reasons={:?}", a.pkid, a.reasons),
+            format!(
+                "pkid={} reasons={:?}{}",
+                a.pkid,
+                a.reasons,
+                props!(a.properties)
+            ),
         ),
         Packet::PingResp(_) => ("PINGRESP".into(), String::new()),
         Packet::PingReq(_) => ("PINGREQ".into(), String::new()),
-        Packet::Disconnect(d) => ("DISCONNECT".into(), format!("reason={:?}", d.reason_code)),
-        Packet::Auth(_) => ("AUTH".into(), String::new()),
+        Packet::Disconnect(d) => (
+            "DISCONNECT".into(),
+            format!("reason={:?}{}", d.reason_code, props!(d.properties)),
+        ),
+        Packet::Auth(a) => ("AUTH".into(), props!(a.properties).trim_start().to_owned()),
         Packet::Connect(..) => ("CONNECT".into(), String::new()),
         Packet::Subscribe(_) => ("SUBSCRIBE".into(), String::new()),
         Packet::Unsubscribe(_) => ("UNSUBSCRIBE".into(), String::new()),
@@ -658,15 +842,25 @@ async fn run_v4(mut eventloop: rumqttc::EventLoop, r: Reporter) {
         match polled {
             Ok(Event::Incoming(packet)) => {
                 let (kind, details) = describe_incoming_v4(&packet);
-                r.packet(Direction::Received, kind, details);
+                let message = match &packet {
+                    Packet::Publish(p) => {
+                        Replay::publish(&p.topic, p.qos as u8, p.retain, &p.payload, &[])
+                    }
+                    _ => None,
+                };
+                r.log(PacketLogEntry::new(Direction::Received, kind, details).with_replay(message));
                 match packet {
                     Packet::ConnAck(_) if !connected => {
                         connected = true;
                         r.state(ConnectionState::Connected, None);
                     }
-                    Packet::Publish(p) => {
-                        r.message(p.topic.clone(), p.payload.to_vec(), p.qos as u8, p.retain)
-                    }
+                    Packet::Publish(p) => r.message(
+                        p.topic.clone(),
+                        p.payload.to_vec(),
+                        p.qos as u8,
+                        p.retain,
+                        Vec::new(),
+                    ),
                     _ => {}
                 }
             }
@@ -683,6 +877,7 @@ async fn run_v4(mut eventloop: rumqttc::EventLoop, r: Reporter) {
     }
 }
 
+/// Like [`describe_incoming_v5`], for MQTT 3.1.1.
 fn describe_incoming_v4(packet: &rumqttc::Packet) -> (String, String) {
     use rumqttc::Packet;
     match packet {
@@ -691,7 +886,7 @@ fn describe_incoming_v4(packet: &rumqttc::Packet) -> (String, String) {
             format!("code={:?} session_present={}", a.code, a.session_present),
         ),
         Packet::Publish(p) => (
-            "PUBLISH".into(),
+            "RECEIVE".into(),
             format!(
                 "topic={} qos={} retain={} pkid={} payload={}",
                 p.topic,
@@ -730,7 +925,8 @@ async fn timeout_elapsed() -> tokio::time::error::Elapsed {
         .unwrap_err()
 }
 
-fn describe_outgoing(out: &Outgoing, pending: &Mutex<VecDeque<String>>) -> (String, String) {
+/// Kind, details, and (for PUBLISH and SUBSCRIBE) the full request, for an outgoing packet.
+fn describe_outgoing(out: &Outgoing, pending: &Pending) -> (String, String, Option<Replay>) {
     let take = || {
         pending
             .lock()
@@ -738,18 +934,27 @@ fn describe_outgoing(out: &Outgoing, pending: &Mutex<VecDeque<String>>) -> (Stri
             .and_then(|mut p| p.pop_front())
             .unwrap_or_default()
     };
+    let queued = |kind: &str, pkid: &u16| {
+        let (description, replay) = take();
+        (
+            kind.to_owned(),
+            format!("pkid={pkid} {description}"),
+            replay,
+        )
+    };
+    let plain = |kind: &str, details: String| (kind.to_owned(), details, None);
     match out {
-        Outgoing::Publish(pkid) => ("PUBLISH".into(), format!("pkid={pkid} {}", take())),
-        Outgoing::Subscribe(pkid) => ("SUBSCRIBE".into(), format!("pkid={pkid} {}", take())),
-        Outgoing::Unsubscribe(pkid) => ("UNSUBSCRIBE".into(), format!("pkid={pkid} {}", take())),
-        Outgoing::PubAck(pkid) => ("PUBACK".into(), format!("pkid={pkid}")),
-        Outgoing::PubRec(pkid) => ("PUBREC".into(), format!("pkid={pkid}")),
-        Outgoing::PubRel(pkid) => ("PUBREL".into(), format!("pkid={pkid}")),
-        Outgoing::PubComp(pkid) => ("PUBCOMP".into(), format!("pkid={pkid}")),
-        Outgoing::PingReq => ("PINGREQ".into(), String::new()),
-        Outgoing::PingResp => ("PINGRESP".into(), String::new()),
-        Outgoing::Disconnect => ("DISCONNECT".into(), "normal disconnection".into()),
-        Outgoing::AwaitAck(pkid) => ("AWAITACK".into(), format!("pkid={pkid}")),
+        Outgoing::Publish(pkid) => queued("PUBLISH", pkid),
+        Outgoing::Subscribe(pkid) => queued("SUBSCRIBE", pkid),
+        Outgoing::Unsubscribe(pkid) => queued("UNSUBSCRIBE", pkid),
+        Outgoing::PubAck(pkid) => plain("PUBACK", format!("pkid={pkid}")),
+        Outgoing::PubRec(pkid) => plain("PUBREC", format!("pkid={pkid}")),
+        Outgoing::PubRel(pkid) => plain("PUBREL", format!("pkid={pkid}")),
+        Outgoing::PubComp(pkid) => plain("PUBCOMP", format!("pkid={pkid}")),
+        Outgoing::PingReq => plain("PINGREQ", String::new()),
+        Outgoing::PingResp => plain("PINGRESP", String::new()),
+        Outgoing::Disconnect => plain("DISCONNECT", "normal disconnection".into()),
+        Outgoing::AwaitAck(pkid) => plain("AWAITACK", format!("pkid={pkid}")),
     }
 }
 
@@ -927,6 +1132,7 @@ mod tests {
             clean_session: true,
             session_expiry_secs: None,
             last_will: None,
+            user_properties: Vec::new(),
         }
     }
 
@@ -955,6 +1161,7 @@ mod tests {
             payload: vec![],
             qos: 1,
             retain: false,
+            user_properties: Vec::new(),
         });
         assert!(c.validate().unwrap_err().message.contains("Last will"));
         c.last_will.as_mut().unwrap().topic = "status/offline".into();
@@ -973,6 +1180,7 @@ mod tests {
             payload: b"bye".to_vec(),
             qos: 0,
             retain: true,
+            user_properties: Vec::new(),
         });
         let d = c.describe();
         assert!(d.contains("clean_start=false"));
@@ -1063,14 +1271,23 @@ mod tests {
 
     #[test]
     fn outgoing_descriptions_consume_pending_in_order() {
-        let pending = Mutex::new(VecDeque::from(["first".to_string(), "second".to_string()]));
-        assert!(describe_outgoing(&Outgoing::Publish(1), &pending)
-            .1
-            .ends_with("first"));
-        assert!(describe_outgoing(&Outgoing::Subscribe(2), &pending)
-            .1
-            .ends_with("second"));
-        assert_eq!(describe_outgoing(&Outgoing::PingReq, &pending).0, "PINGREQ");
+        let sub = Replay::Subscribe {
+            filter: "a/#".into(),
+            qos: 1,
+            user_properties: Vec::new(),
+        };
+        let pending = Mutex::new(VecDeque::from([
+            ("first".to_string(), None),
+            ("second".to_string(), Some(sub.clone())),
+        ]));
+        let (_, details, replay) = describe_outgoing(&Outgoing::Publish(1), &pending);
+        assert!(details.ends_with("first"));
+        assert_eq!(replay, None);
+        let (_, details, replay) = describe_outgoing(&Outgoing::Subscribe(2), &pending);
+        assert!(details.ends_with("second"));
+        assert_eq!(replay, Some(sub));
+        let (kind, _, replay) = describe_outgoing(&Outgoing::PingReq, &pending);
+        assert_eq!((kind.as_str(), replay), ("PINGREQ", None));
     }
 
     #[test]
@@ -1102,6 +1319,7 @@ mod tests {
                 payload: b"gone".to_vec(),
                 qos: 1,
                 retain: false,
+                user_properties: Vec::new(),
             });
             let _conn = Connection::start(rt.handle(), 7, c, sink).unwrap();
 
@@ -1208,7 +1426,9 @@ mod broker_tests {
                 payload: b"offline".to_vec(),
                 qos: 1,
                 retain: false,
+                user_properties: vec![("reason".into(), "test".into())],
             }),
+            user_properties: vec![("app".into(), "unit-test".into())],
         };
         let (tx, events) = channel();
         let sink: EventSink = Arc::new(move |id, ev| {
@@ -1229,26 +1449,40 @@ mod broker_tests {
             let mut s = connect(version, Behavior::Accept);
             assert_eq!(s.conn.version, version);
             s.wait_state(ConnectionState::Connecting);
+            let v5 = version == MqttVersion::V5;
+            // MQTT 5 User Properties: sent where set, shown on what comes back. 3.1.1 has none.
+            let props = vec![("source".to_owned(), "unit-test".to_owned())];
+            let shows = |details: &str, pairs: &str| {
+                assert_eq!(
+                    details.contains(&format!("user_properties=[{pairs}]")),
+                    v5,
+                    "{version:?}: {details}"
+                );
+            };
             let connect = s.wait_packet(Direction::Sent, "CONNECT");
             assert!(
                 connect.details.contains("client_id=device-1"),
                 "{}",
                 connect.details
             );
-            s.wait_packet(Direction::Received, "CONNACK");
+            shows(&connect.details, "app=unit-test");
+            shows(&connect.details, "reason=test");
+            let connack = s.wait_packet(Direction::Received, "CONNACK");
+            shows(&connack.details, "broker=fake");
             s.wait_state(ConnectionState::Connected);
 
-            s.conn.subscribe("sensors/#", 1).unwrap();
+            s.conn.subscribe("sensors/#", 1, &props).unwrap();
             let sub = s.wait_packet(Direction::Sent, "SUBSCRIBE");
             assert!(
                 sub.details.contains("filter=sensors/# qos=1"),
                 "{}",
                 sub.details
             );
+            shows(&sub.details, "source=unit-test");
             s.wait_packet(Direction::Received, "SUBACK");
 
             s.conn
-                .publish("sensors/1", 1, false, b"{\"t\":21}".to_vec())
+                .publish("sensors/1", 1, false, b"{\"t\":21}".to_vec(), &props)
                 .unwrap();
             let sent = s.wait_packet(Direction::Sent, "PUBLISH");
             assert!(
@@ -1257,29 +1491,41 @@ mod broker_tests {
                 sent.details
             );
             s.wait_packet(Direction::Received, "PUBACK");
+            shows(&sent.details, "source=unit-test");
+            let received = s.wait_packet(Direction::Received, "RECEIVE");
+            assert!(
+                received.details.contains("topic=sensors/1"),
+                "{}",
+                received.details
+            );
+            shows(&received.details, "source=unit-test");
             let msg = s.wait_message();
             assert_eq!(msg.topic, "sensors/1");
+            assert_eq!(msg.user_properties, if v5 { props.clone() } else { vec![] });
             assert_eq!(msg.payload, b"{\"t\":21}");
             assert_eq!(msg.qos, 1);
             s.wait_packet(Direction::Sent, "PUBACK");
 
             s.conn
-                .publish("sensors/2", 0, true, b"zero".to_vec())
+                .publish("sensors/2", 0, true, b"zero".to_vec(), &[])
                 .unwrap();
             assert_eq!(s.wait_message().payload, b"zero");
 
             s.conn
-                .publish("sensors/3", 2, false, b"two".to_vec())
+                .publish("sensors/3", 2, false, b"two".to_vec(), &[])
                 .unwrap();
             s.wait_packet(Direction::Received, "PUBREC");
             s.wait_packet(Direction::Sent, "PUBREL");
             s.wait_packet(Direction::Received, "PUBCOMP");
 
-            let err = s.conn.publish("sensors/+", 0, false, vec![]).unwrap_err();
+            let err = s
+                .conn
+                .publish("sensors/+", 0, false, vec![], &[])
+                .unwrap_err();
             assert_eq!(err.category, ErrorCategory::Configuration);
-            assert!(s.conn.subscribe("", 0).is_err());
+            assert!(s.conn.subscribe("", 0, &[]).is_err());
 
-            s.conn.unsubscribe("sensors/#").unwrap();
+            s.conn.unsubscribe("sensors/#", &[]).unwrap();
             let unsub = s.wait_packet(Direction::Sent, "UNSUBSCRIBE");
             assert!(
                 unsub.details.contains("filter=sensors/#"),
@@ -1334,7 +1580,7 @@ mod broker_tests {
         let mut s = connect(MqttVersion::V311, Behavior::Refuse);
         s.wait_state(ConnectionState::Error);
         // The event loop is gone; queuing may still succeed (bounded channel) but must not panic.
-        let _ = s.conn.publish("a/b", 0, false, vec![]);
+        let _ = s.conn.publish("a/b", 0, false, vec![], &[]);
         s.conn.disconnect();
         s.wait_state(ConnectionState::Disconnecting);
     }

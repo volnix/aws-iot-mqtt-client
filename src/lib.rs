@@ -6,6 +6,7 @@
 pub mod app;
 pub mod aws;
 pub mod certs;
+pub mod cli_export;
 pub mod error;
 pub mod fonts;
 pub mod icons;
@@ -15,7 +16,9 @@ pub mod paths;
 pub mod policy_sim;
 pub mod provision;
 pub mod shadow;
+pub mod shadow_fields;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod theme;
+pub mod trace_export;
 pub mod validators;

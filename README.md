@@ -26,6 +26,8 @@ macOS, Windows, and Linux.
 - Pick the account's default endpoint or one of your custom domains.
 - Use MQTT 5 or MQTT 3.1.1, with clean or persistent sessions, session expiry, and a last will
   message.
+- With MQTT 5, add User Properties to CONNECT, the last will, PUBLISH, SUBSCRIBE, and
+  UNSUBSCRIBE. Properties on received messages and broker packets are shown too.
 
 **Publish, subscribe, and watch**
 
@@ -54,9 +56,16 @@ macOS, Windows, and Linux.
   **Accept** or **Reject**, with the statement that decided it.
 - It runs entirely on your machine and updates as you type.
 
+**Take it to the command line**
+
+- In the MQTT log, copy any PUBLISH or SUBSCRIBE you sent as a ready-to-run `mosquitto_pub` or
+  `mosquitto_sub` command, for macOS/Linux shells or PowerShell. It uses the same endpoint,
+  client ID, protocol settings, and certificate files.
+
 **See everything it does**
 
-- A packet log shows every MQTT packet sent and received.
+- A packet log shows every MQTT packet sent and received. Export it as JSON or text to share a
+  trace.
 - An API log shows every AWS call, with timing and request IDs. Secrets are never logged.
 
 ## Download and install

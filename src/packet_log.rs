@@ -24,6 +24,52 @@ impl Direction {
     }
 }
 
+/// A PUBLISH (sent or received) or a sent SUBSCRIBE, kept in full so it can be repeated from
+/// the command line or exported (`details` is truncated for display).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Replay {
+    Publish {
+        topic: String,
+        qos: u8,
+        retain: bool,
+        /// UTF-8 text; binary payloads aren't kept.
+        payload: String,
+        /// MQTT 5 User Properties (empty for 3.1.1).
+        user_properties: Vec<(String, String)>,
+    },
+    Subscribe {
+        filter: String,
+        qos: u8,
+        user_properties: Vec<(String, String)>,
+    },
+}
+
+/// Payloads larger than this aren't kept for [`Replay`].
+pub const REPLAY_PAYLOAD_MAX: usize = 64 * 1024;
+
+impl Replay {
+    /// A replayable publish, if the payload is text and not too large.
+    pub fn publish(
+        topic: &str,
+        qos: u8,
+        retain: bool,
+        payload: &[u8],
+        user_properties: &[(String, String)],
+    ) -> Option<Self> {
+        if payload.len() > REPLAY_PAYLOAD_MAX {
+            return None;
+        }
+        let payload = std::str::from_utf8(payload).ok()?.to_owned();
+        Some(Replay::Publish {
+            topic: topic.to_owned(),
+            qos,
+            retain,
+            payload,
+            user_properties: user_properties.to_vec(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PacketLogEntry {
     pub timestamp: ZonedDateTime,
@@ -31,6 +77,8 @@ pub struct PacketLogEntry {
     /// Packet type, e.g. `CONNECT`, `PUBLISH`.
     pub kind: String,
     pub details: String,
+    /// Set for PUBLISH packets (both directions) and sent SUBSCRIBE packets.
+    pub replay: Option<Replay>,
 }
 
 impl PacketLogEntry {
@@ -40,7 +88,13 @@ impl PacketLogEntry {
             direction,
             kind: kind.into(),
             details: details.into(),
+            replay: None,
         }
+    }
+
+    pub fn with_replay(mut self, replay: Option<Replay>) -> Self {
+        self.replay = replay;
+        self
     }
 
     pub fn is_ping(&self) -> bool {
@@ -117,6 +171,17 @@ pub fn format_payload(payload: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_text_payloads_within_the_limit_are_replayable() {
+        assert!(Replay::publish("t", 0, false, b"{\"a\":1}", &[]).is_some());
+        assert!(
+            Replay::publish("t", 0, false, &[0xff, 0xfe], &[]).is_none(),
+            "not UTF-8"
+        );
+        let big = vec![b'x'; REPLAY_PAYLOAD_MAX + 1];
+        assert!(Replay::publish("t", 0, false, &big, &[]).is_none());
+    }
     use proptest::prelude::*;
 
     #[test]

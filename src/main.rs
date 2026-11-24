@@ -16,11 +16,16 @@ fn main() -> eframe::Result<()> {
             .expect("failed to start tokio runtime"),
     );
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("AWS IoT MQTT Client")
+        .with_inner_size([1200.0, 820.0])
+        .with_min_inner_size([820.0, 520.0]);
+    // Window, taskbar, and (when not run from the .app bundle) Dock icon.
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/icon.png")) {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("AWS IoT MQTT Client")
-            .with_inner_size([1200.0, 820.0])
-            .with_min_inner_size([820.0, 520.0]),
+        viewport,
         ..Default::default()
     };
 

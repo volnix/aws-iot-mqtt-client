@@ -25,15 +25,18 @@ use crate::mqtt::{
     self, Connection, ConnectionConfig, ConnectionState, EventSink, LastWill, MqttEvent,
     MqttVersion, ReceivedMessage,
 };
-use crate::packet_log::{format_payload, Direction, PacketLog, PacketLogEntry};
+use crate::packet_log::{format_payload, Direction, PacketLog, PacketLogEntry, Replay};
 use crate::provision::{
     self, ArnScope, Identity, PolicyChoice, ProvisionOutcome, ProvisionRequest,
 };
 use crate::theme::{self, Palette, Severity, ThemeWatcher};
+use crate::trace_export;
 use crate::validators::{topic_matches, validate_client_id};
 
+mod cli_dialog;
 mod shadows;
 mod simulator;
+use cli_dialog::CliDialog;
 use shadows::ShadowState;
 use simulator::{SimSettings, SimState};
 
@@ -131,6 +134,12 @@ struct Settings {
     will_payload: String,
     will_qos: u8,
     will_retain: bool,
+    /// MQTT 5 User Properties, by packet. Rows with an empty name aren't sent.
+    connect_user_properties: Vec<(String, String)>,
+    will_user_properties: Vec<(String, String)>,
+    publish_user_properties: Vec<(String, String)>,
+    /// Sent with SUBSCRIBE and UNSUBSCRIBE.
+    subscription_user_properties: Vec<(String, String)>,
     /// Ask GetConnection for client/endpoint IP addresses and ports.
     include_socket_info: bool,
     theme: ThemeChoice,
@@ -166,6 +175,10 @@ impl Default for Settings {
             will_payload: String::new(),
             will_qos: 0,
             will_retain: false,
+            connect_user_properties: Vec::new(),
+            will_user_properties: Vec::new(),
+            publish_user_properties: Vec::new(),
+            subscription_user_properties: Vec::new(),
             include_socket_info: false,
             theme: ThemeChoice::default(),
             logs_open: false,
@@ -353,6 +366,9 @@ pub struct MqttApp {
     account_open: bool,
     /// The less common GetConnection fields.
     show_more_info: bool,
+    /// The composer's and subscribe row's User Properties editors.
+    show_publish_props: bool,
+    show_subscription_props: bool,
     /// Re-applies `assets/theme.json` on save (debug builds, or AWS_IOT_MQTT_THEME_FILE).
     theme_watcher: Option<ThemeWatcher>,
     sim: SimState,
@@ -360,6 +376,8 @@ pub struct MqttApp {
     shadow: ShadowState,
 
     provision: Option<ProvisionDialog>,
+    /// "Copy as mosquitto_pub/sub" dialog.
+    cli: Option<CliDialog>,
     notice: Option<String>,
 
     /// Tests: open sessions from this SDK config (an offline fake) instead of the real chain.
@@ -368,6 +386,9 @@ pub struct MqttApp {
     /// Tests: trust these roots (a local test broker's CA) instead of the bundled ones.
     #[cfg(test)]
     test_tls_roots: Option<rustls::RootCertStore>,
+    /// Tests: save exported traces here instead of asking with a file dialog.
+    #[cfg(test)]
+    test_export_path: Option<PathBuf>,
 }
 
 impl MqttApp {
@@ -416,16 +437,21 @@ impl MqttApp {
             show_advanced: false,
             account_open: false,
             show_more_info: false,
+            show_publish_props: false,
+            show_subscription_props: false,
             theme_watcher: ThemeWatcher::for_build(),
             sim: SimState::default(),
             live: LiveState::default(),
             shadow: ShadowState::default(),
             provision: None,
+            cli: None,
             notice: None,
             #[cfg(test)]
             test_sdk_config: None,
             #[cfg(test)]
             test_tls_roots: None,
+            #[cfg(test)]
+            test_export_path: None,
             settings,
         };
         if let Some(p) = app.settings.cert_path.clone() {
@@ -586,7 +612,9 @@ impl MqttApp {
                 payload: self.settings.will_payload.clone().into_bytes(),
                 qos: self.settings.will_qos,
                 retain: self.settings.will_retain,
+                user_properties: to_send(&self.settings.will_user_properties),
             }),
+            user_properties: to_send(&self.settings.connect_user_properties),
         };
 
         let id = self.next_connection_id;
@@ -868,9 +896,7 @@ impl MqttApp {
             MqttEvent::Packet(entry) => {
                 let changed_subscriptions = entry.direction == Direction::Received
                     && (entry.kind == "SUBACK" || entry.kind == "UNSUBACK");
-                if entry.direction == Direction::Received && entry.kind == "SUBACK" {
-                    self.shadow_suback(&entry.details);
-                }
+                self.shadow_packet(&entry);
                 self.log.push(entry);
                 if changed_subscriptions {
                     self.fetch_live_subscriptions(ctx, Duration::from_secs(1));
@@ -962,6 +988,66 @@ impl MqttApp {
         });
     }
 
+    /// About the connection the MQTT log came from, for an exported trace.
+    fn trace_info(&self) -> trace_export::TraceInfo {
+        let (endpoint, client_id) = match &self.connected_as {
+            Some((endpoint, client_id)) => (Some(endpoint.clone()), Some(client_id.clone())),
+            None => (
+                Some(self.settings.endpoint.trim().to_owned()).filter(|e| !e.is_empty()),
+                self.effective_client_id(),
+            ),
+        };
+        trace_export::TraceInfo {
+            exported_at: jiff::ZonedDateTime::now(),
+            endpoint,
+            client_id,
+            protocol: self.settings.mqtt_version.label().to_owned(),
+        }
+    }
+
+    /// Saves the MQTT log as a trace: `.txt` gets text, anything else JSON.
+    fn export_trace(&mut self) {
+        let info = self.trace_info();
+        #[cfg(test)]
+        let path = self.test_export_path.clone();
+        #[cfg(not(test))]
+        let path = rfd::FileDialog::new()
+            .set_title("Export MQTT trace")
+            .set_file_name(trace_export::file_name(&info, "json"))
+            .add_filter("JSON", &["json"])
+            .add_filter("Text", &["txt"])
+            .save_file();
+        let Some(path) = path else {
+            return;
+        };
+        let entries: Vec<&PacketLogEntry> = self.log.entries().collect();
+        let text = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("txt"));
+        let contents = if text {
+            trace_export::to_text(&info, &entries)
+        } else {
+            trace_export::to_json(&info, &entries)
+        };
+        match std::fs::write(&path, contents) {
+            Ok(()) => {
+                let n = entries.len();
+                self.notice = Some(format!(
+                    "Exported {n} MQTT packet{} to {}",
+                    if n == 1 { "" } else { "s" },
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                self.action_error = Some(
+                    AppError::configuration("Couldn't save the trace")
+                        .with_details(e.to_string())
+                        .with_action("Choose a folder you can write to."),
+                );
+            }
+        }
+    }
+
     fn load_certificate(&mut self, path: &Path) {
         self.settings.cert_path = Some(path.to_owned());
         self.cert = Some(certs::read_file(path).and_then(|b| certs::parse_certificate(&b)));
@@ -983,7 +1069,7 @@ impl MqttApp {
             ui.add_space(6.0);
             for (view, label) in [
                 (View::Client, "Client".to_owned()),
-                (View::Shadows, self.shadows_tab_label()),
+                (View::Shadows, "Shadows".to_owned()),
                 (View::Simulator, "Policy simulator".to_owned()),
             ] {
                 if theme::tab(ui, self.settings.view == view, label).clicked() {
@@ -1421,11 +1507,7 @@ impl MqttApp {
         let mut refresh_subs = false;
         let mut unsubscribe: Option<String> = None;
         theme::card(ui, |ui| {
-            let count = match &self.live.subscriptions {
-                Some(Ok(list)) => format!(" {}", list.len()),
-                _ => String::new(),
-            };
-            theme::card_title(ui, &format!("Subscriptions{count}"), |ui| {
+            theme::card_title(ui, "Subscriptions", |ui| {
                 if self.live.subscriptions_loading {
                     ui.spinner();
                 } else {
@@ -1434,6 +1516,11 @@ impl MqttApp {
                             .clicked();
                 }
             });
+            if let Some(Ok(list)) = &self.live.subscriptions {
+                if !list.is_empty() {
+                    theme::count_caption(ui, list.len(), "active");
+                }
+            }
             let rows: Vec<(String, Option<i32>)> = match &self.live.subscriptions {
                 Some(Ok(list)) => {
                     if list.is_empty() {
@@ -1455,11 +1542,20 @@ impl MqttApp {
                 }
                 None => Vec::new(),
             };
+            let shadow_filter = self.shadow_filter();
             for (filter, qos) in rows {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&filter).monospace());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::icon_button(ui, icons::CLOSE, "Unsubscribe", true).clicked() {
+                        if Some(&filter) == shadow_filter.as_ref() {
+                            // Unsubscribing would stop the Shadows tab from getting answers.
+                            theme::pill(ui, "Used by Shadows", p.info).on_hover_text(
+                                "The app subscribes here to read and update this Thing's \
+                                 shadows.",
+                            );
+                        } else if theme::icon_button(ui, icons::CLOSE, "Unsubscribe", true)
+                            .clicked()
+                        {
                             unsubscribe = Some(filter.clone());
                         }
                         if let Some(qos) = qos {
@@ -1474,7 +1570,8 @@ impl MqttApp {
         }
         if let (Some(filter), Some(connection)) = (unsubscribe, &self.connection) {
             self.subscriptions.retain(|s| s != &filter);
-            if let Err(e) = connection.unsubscribe(&filter) {
+            let props = to_send(&self.settings.subscription_user_properties);
+            if let Err(e) = connection.unsubscribe(&filter, &props) {
                 self.action_error = Some(e);
             }
         }
@@ -1581,7 +1678,6 @@ impl MqttApp {
     }
 
     fn connection_essentials(&mut self, ui: &mut egui::Ui) {
-        let p = Palette::of(ui);
         egui::Grid::new("conn_grid")
             .num_columns(2)
             .spacing([16.0, 10.0])
@@ -1603,60 +1699,66 @@ impl MqttApp {
                 });
                 ui.end_row();
 
-                theme::field_label(ui, "Certificate");
-                ui.vertical(|ui| {
-                    if let Some(path) = file_row(
-                        ui,
-                        self.settings.cert_path.as_deref(),
-                        "cert",
-                        &["pem", "crt", "cer"],
-                    ) {
-                        self.load_certificate(&path);
-                    }
-                    match &self.cert {
-                        Some(Ok(c)) => {
-                            ui.horizontal(|ui| {
-                                if !c.currently_valid {
-                                    theme::pill(ui, "Expired", p.err);
-                                }
-                                theme::disclosure(ui, &mut self.show_cert_details, "Details");
-                            });
-                            if self.show_cert_details {
-                                theme::inset(ui, |ui| {
-                                    for (key, value) in [
-                                        ("Subject", c.subject.clone()),
-                                        ("Issuer", c.issuer.clone()),
-                                        ("Valid", format!("{} to {}", c.not_before, c.not_after)),
-                                        ("ID", c.certificate_id.clone()),
-                                    ] {
-                                        ui.label(RichText::new(key).small().color(p.muted));
-                                        ui.label(RichText::new(value).small().monospace());
-                                    }
-                                });
-                            }
-                        }
-                        Some(Err(e)) => show_error(ui, Some(e)),
-                        None => {}
-                    }
-                });
-                ui.end_row();
-
-                theme::field_label(ui, "Private key");
-                ui.vertical(|ui| {
-                    if let Some(path) = file_row(
-                        ui,
-                        self.settings.key_path.as_deref(),
-                        "key",
-                        &["pem", "key"],
-                    ) {
-                        self.load_private_key(&path);
-                    }
-                    if let Some(Err(e)) = &self.key {
-                        show_error(ui, Some(e));
-                    }
-                });
-                ui.end_row();
+                self.certificate_fields(ui);
             });
+    }
+
+    /// Certificate and private key rows, for a two-column `Grid`.
+    pub(super) fn certificate_fields(&mut self, ui: &mut egui::Ui) {
+        let p = Palette::of(ui);
+        theme::field_label(ui, "Certificate");
+        ui.vertical(|ui| {
+            if let Some(path) = file_row(
+                ui,
+                self.settings.cert_path.as_deref(),
+                "cert",
+                &["pem", "crt", "cer"],
+            ) {
+                self.load_certificate(&path);
+            }
+            match &self.cert {
+                Some(Ok(c)) => {
+                    ui.horizontal(|ui| {
+                        if !c.currently_valid {
+                            theme::pill(ui, "Expired", p.err);
+                        }
+                        theme::disclosure(ui, &mut self.show_cert_details, "Details");
+                    });
+                    if self.show_cert_details {
+                        theme::inset(ui, |ui| {
+                            for (key, value) in [
+                                ("Subject", c.subject.clone()),
+                                ("Issuer", c.issuer.clone()),
+                                ("Valid", format!("{} to {}", c.not_before, c.not_after)),
+                                ("ID", c.certificate_id.clone()),
+                            ] {
+                                ui.label(RichText::new(key).small().color(p.muted));
+                                ui.label(RichText::new(value).small().monospace());
+                            }
+                        });
+                    }
+                }
+                Some(Err(e)) => show_error(ui, Some(e)),
+                None => {}
+            }
+        });
+        ui.end_row();
+
+        theme::field_label(ui, "Private key");
+        ui.vertical(|ui| {
+            if let Some(path) = file_row(
+                ui,
+                self.settings.key_path.as_deref(),
+                "key",
+                &["pem", "key"],
+            ) {
+                self.load_private_key(&path);
+            }
+            if let Some(Err(e)) = &self.key {
+                show_error(ui, Some(e));
+            }
+        });
+        ui.end_row();
     }
 
     /// Session and last-will options. Collapsed by default; non-default values are summarized
@@ -1672,6 +1774,14 @@ impl MqttApp {
         }
         if self.settings.will_enabled {
             chips.push("Last will".to_owned());
+        }
+        let v5 = self.settings.mqtt_version == MqttVersion::V5;
+        let connect_props = to_send(&self.settings.connect_user_properties).len();
+        if v5 && connect_props > 0 {
+            chips.push(format!(
+                "{connect_props} user propert{}",
+                if connect_props == 1 { "y" } else { "ies" }
+            ));
         }
         let mut open = self.show_advanced || force_open;
         ui.horizontal(|ui| {
@@ -1744,6 +1854,29 @@ impl MqttApp {
                             ) {
                                 ui.label(RichText::new(e).small().color(p.err));
                             }
+                            if v5 {
+                                theme::field_label(ui, "Will user properties");
+                                user_properties_editor(
+                                    ui,
+                                    "will_props",
+                                    &mut self.settings.will_user_properties,
+                                );
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    theme::field_label(ui, "User properties");
+                    ui.vertical(|ui| {
+                        if v5 {
+                            theme::hint(ui, "Sent with CONNECT.");
+                            user_properties_editor(
+                                ui,
+                                "connect_props",
+                                &mut self.settings.connect_user_properties,
+                            );
+                        } else {
+                            theme::hint(ui, "User properties need MQTT 5.");
                         }
                     });
                     ui.end_row();
@@ -1918,10 +2051,25 @@ impl MqttApp {
                     self.subscribe_from_input();
                 }
             });
+            user_properties_section(
+                ui,
+                "subscription_props",
+                "User properties for subscribe and unsubscribe",
+                &mut self.show_subscription_props,
+                self.settings.mqtt_version == MqttVersion::V5,
+                &mut self.settings.subscription_user_properties,
+            );
         }
 
-        // The stream fills the card; the composer is pinned underneath it.
-        let composer_height = if connected { 150.0 } else { 0.0 };
+        // The stream fills the card; the composer is pinned underneath it, including its
+        // User Properties rows when they're open.
+        let v5 = self.settings.mqtt_version == MqttVersion::V5;
+        let props_height = match (v5, self.show_publish_props) {
+            (false, _) => 0.0,
+            (true, false) => 26.0,
+            (true, true) => 26.0 + 30.0 * (self.settings.publish_user_properties.len() + 1) as f32,
+        };
+        let composer_height = if connected { 150.0 + props_height } else { 0.0 };
         let stream_height = (ui.available_height() - composer_height).max(90.0);
         egui::ScrollArea::vertical()
             .id_salt("messages")
@@ -1952,7 +2100,8 @@ impl MqttApp {
             return;
         };
         let filter = self.settings.subscribe_filter.trim().to_owned();
-        match connection.subscribe(&filter, self.subscribe_qos) {
+        let props = to_send(&self.settings.subscription_user_properties);
+        match connection.subscribe(&filter, self.subscribe_qos, &props) {
             Ok(()) => {
                 self.action_error = None;
                 if !self.subscriptions.contains(&filter) {
@@ -1982,6 +2131,7 @@ impl MqttApp {
                             self.publish_qos,
                             self.publish_retain,
                             self.publish_payload.clone().into_bytes(),
+                            &to_send(&self.settings.publish_user_properties),
                         );
                         self.action_error = result.err();
                     }
@@ -1993,6 +2143,14 @@ impl MqttApp {
                     .frame(egui::Frame::new())
                     .desired_rows(3)
                     .desired_width(f32::INFINITY),
+            );
+            user_properties_section(
+                ui,
+                "publish_props",
+                "User properties",
+                &mut self.show_publish_props,
+                self.settings.mqtt_version == MqttVersion::V5,
+                &mut self.settings.publish_user_properties,
             );
         });
         if self.action_error.is_some() {
@@ -2035,6 +2193,18 @@ impl MqttApp {
                         if clear {
                             self.log.clear();
                         }
+                        let export = ui
+                            .add_enabled_ui(!self.log.is_empty(), |ui| {
+                                theme::link_button(ui, "Export…").on_hover_text(
+                                    "Save this log (everything since it was last cleared) as \
+                                     JSON or text, to share a trace",
+                                )
+                            })
+                            .inner
+                            .clicked();
+                        if export {
+                            self.export_trace();
+                        }
                         ui.checkbox(&mut self.hide_pings, "Hide pings");
                     }
                     LogTab::Api => {
@@ -2053,11 +2223,13 @@ impl MqttApp {
                     .entries()
                     .filter(|e| !(self.hide_pings && e.is_ping()))
                     .collect();
-                log_rows(ui, "mqtt_log", &rows, 11);
+                if let Some(replay) = log_rows(ui, "mqtt_log", &rows, 11, true) {
+                    self.open_cli_dialog(replay);
+                }
             }
             LogTab::Api => {
                 let rows: Vec<_> = self.api_log.entries().collect();
-                log_rows(ui, "api_log", &rows, 27);
+                log_rows(ui, "api_log", &rows, 27, false);
             }
         }
     }
@@ -2074,24 +2246,8 @@ impl MqttApp {
         let mut submit = false;
         let validation = d.validation_error();
 
-        let frame = {
-            let tokens = theme::tokens(ctx);
-            let colors = tokens.colors(ctx.theme());
-            let m = tokens.metrics;
-            egui::Frame::new()
-                .fill(colors.glass_strong.0)
-                .stroke(egui::Stroke::new(1.0, colors.glass_border.0))
-                .corner_radius(egui::CornerRadius::same(m.card_radius))
-                .inner_margin(Margin::same(m.card_padding + 6))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, m.shadow_offset_y],
-                    blur: m.shadow_blur,
-                    spread: 0,
-                    color: colors.shadow.0,
-                })
-        };
         let response = egui::Modal::new(egui::Id::unique("provision_dialog"))
-            .frame(frame)
+            .frame(modal_frame(ctx))
             .show(ctx, |ui| {
                 let p = Palette::of(ui);
                 ui.set_width(620.0);
@@ -2340,6 +2496,8 @@ impl MqttApp {
         self.expire_shadow_requests();
         theme::paint_background(&ctx);
         self.provision_dialog(&ctx);
+        self.cli_dialog(&ctx);
+        theme::paint_toast(&ctx);
 
         let gap = theme::tokens(&ctx).metrics.gap;
         let g = gap as i8;
@@ -2410,12 +2568,100 @@ impl MqttApp {
     }
 }
 
-/// One received message: topic and metadata, then the payload.
+/// User Properties to send: rows with an empty name are left out.
+fn to_send(props: &[(String, String)]) -> Vec<(String, String)> {
+    props
+        .iter()
+        .filter(|(name, _)| !name.trim().is_empty())
+        .map(|(name, value)| (name.trim().to_owned(), value.clone()))
+        .collect()
+}
+
+/// Rows of name/value pairs with a remove button each, and "Add property".
+fn user_properties_editor(ui: &mut egui::Ui, id: &str, props: &mut Vec<(String, String)>) {
+    let mut remove = None;
+    for (index, (name, value)) in props.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(name)
+                    .id_salt((id, "name", index))
+                    .hint_text("name")
+                    .desired_width(130.0),
+            );
+            let width = (ui.available_width() - 34.0).max(80.0);
+            ui.add(
+                egui::TextEdit::singleline(value)
+                    .id_salt((id, "value", index))
+                    .hint_text("value")
+                    .desired_width(width),
+            );
+            if theme::icon_button(ui, icons::CLOSE, "Remove property", true).clicked() {
+                remove = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        props.remove(index);
+    }
+    if theme::link_button(ui, &format!("{} Add property", icons::ADD)).clicked() {
+        props.push((String::new(), String::new()));
+    }
+}
+
+/// A collapsible User Properties editor with a count, or a note on MQTT 3.1.1.
+fn user_properties_section(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    open: &mut bool,
+    v5: bool,
+    props: &mut Vec<(String, String)>,
+) {
+    if !v5 {
+        return;
+    }
+    let count = to_send(props).len();
+    ui.horizontal(|ui| {
+        theme::disclosure(ui, open, label);
+        if count > 0 {
+            theme::pill(ui, count.to_string(), Palette::of(ui).info);
+        }
+    });
+    if *open {
+        user_properties_editor(ui, id, props);
+    }
+}
+
+/// The glass frame used by dialogs.
+fn modal_frame(ctx: &egui::Context) -> egui::Frame {
+    let tokens = theme::tokens(ctx);
+    let colors = tokens.colors(ctx.theme());
+    let m = tokens.metrics;
+    egui::Frame::new()
+        .fill(colors.glass_strong.0)
+        .stroke(egui::Stroke::new(1.0, colors.glass_border.0))
+        .corner_radius(egui::CornerRadius::same(m.card_radius))
+        .inner_margin(Margin::same(m.card_padding + 6))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, m.shadow_offset_y],
+            blur: m.shadow_blur,
+            spread: 0,
+            color: colors.shadow.0,
+        })
+}
+
+/// One received message: the topic (as a badge) and metadata, the payload, then any User
+/// Properties behind a toggle. The topic and payload each have a copy button.
 fn message_bubble(ui: &mut egui::Ui, message: &ReceivedMessage) {
     let p = Palette::of(ui);
+    // Stable across frames and unique enough: messages are distinct by time and topic.
+    let key = (
+        message.timestamp.timestamp().as_nanosecond(),
+        message.topic.as_str(),
+    );
     theme::inset(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(theme::title(&message.topic).monospace());
+            theme::copyable_pill(ui, &message.topic, p.accent, "Topic");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     RichText::new(message.timestamp.strftime("%H:%M:%S%.3f").to_string())
@@ -2428,7 +2674,54 @@ fn message_bubble(ui: &mut egui::Ui, message: &ReceivedMessage) {
                 theme::pill(ui, format!("QoS {}", message.qos), p.info);
             });
         });
-        ui.label(RichText::new(format_payload(&message.payload, MESSAGE_PAYLOAD_MAX)).monospace());
+        ui.add_space(2.0);
+        ui.horizontal_top(|ui| {
+            // Left-aligned in a fixed-width column, leaving room for the copy button.
+            let width = (ui.available_width() - 30.0).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(width);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format_payload(&message.payload, MESSAGE_PAYLOAD_MAX))
+                                .monospace(),
+                        )
+                        .wrap(),
+                    );
+                },
+            );
+            theme::copy_button(
+                ui,
+                ("payload", key),
+                || String::from_utf8_lossy(&message.payload).into_owned(),
+                "Payload",
+                "Copy payload",
+            );
+        });
+        if !message.user_properties.is_empty() {
+            ui.add_space(2.0);
+            let id = ui.make_persistent_id(("message_props", key));
+            let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+            theme::disclosure(
+                ui,
+                &mut open,
+                &format!("User properties ({})", message.user_properties.len()),
+            );
+            ui.data_mut(|d| d.insert_temp(id, open));
+            if open {
+                ui.indent(("message_props_list", key), |ui| {
+                    for (name, value) in &message.user_properties {
+                        ui.label(
+                            RichText::new(format!("{name}: {value}"))
+                                .small()
+                                .monospace(),
+                        );
+                    }
+                });
+            }
+        }
     });
     ui.add_space(6.0);
 }
@@ -2497,8 +2790,17 @@ fn key_values(ui: &mut egui::Ui, id: &str, rows: &[(&'static str, String)]) {
 }
 
 /// Renders a log as monospace rows: time, direction, kind, details. Errors are red.
-fn log_rows(ui: &mut egui::Ui, id: &str, rows: &[&PacketLogEntry], kind_width: usize) {
+/// Log rows, newest at the bottom. With `copyable`, sent PUBLISH and SUBSCRIBE rows get a
+/// "Copy as mosquitto_pub/sub" button; returns the one clicked.
+fn log_rows(
+    ui: &mut egui::Ui,
+    id: &str,
+    rows: &[&PacketLogEntry],
+    kind_width: usize,
+    copyable: bool,
+) -> Option<Replay> {
     let p = Palette::of(ui);
+    let mut clicked = None;
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
     egui::ScrollArea::both()
         .id_salt(id)
@@ -2536,6 +2838,31 @@ fn log_rows(ui: &mut egui::Ui, id: &str, rows: &[&PacketLogEntry], kind_width: u
                                     .monospace()
                                     .color(if failed { p.err } else { color }),
                             );
+                            if copyable {
+                                // Before the details, so it stays visible when they're long.
+                                // Only for what the app sent: that's what a command repeats.
+                                let replay = entry
+                                    .replay
+                                    .as_ref()
+                                    .filter(|_| entry.direction == Direction::Sent);
+                                match replay {
+                                    Some(replay) => {
+                                        let hover = match replay {
+                                            Replay::Publish { .. } => "Copy as mosquitto_pub",
+                                            Replay::Subscribe { .. } => "Copy as mosquitto_sub",
+                                        };
+                                        if theme::inline_icon_button(ui, icons::COPY, hover)
+                                            .clicked()
+                                        {
+                                            clicked = Some(replay.clone());
+                                        }
+                                    }
+                                    None => {
+                                        let w = ui.text_style_height(&egui::TextStyle::Monospace);
+                                        ui.add_space(w);
+                                    }
+                                }
+                            }
                             ui.label(RichText::new(&entry.details).monospace().color(if failed {
                                 p.err
                             } else {
@@ -2545,6 +2872,7 @@ fn log_rows(ui: &mut egui::Ui, id: &str, rows: &[&PacketLogEntry], kind_width: u
                     });
             }
         });
+    clicked
 }
 
 fn endpoint_hover(e: &DataEndpoint) -> String {
@@ -2565,14 +2893,31 @@ fn show_error(ui: &mut egui::Ui, error: Option<&AppError>) {
     let Some(e) = error else { return };
     let p = Palette::of(ui);
     theme::banner(ui, Severity::Error, icons::WARNING, false, |ui| {
-        ui.label(theme::title(e.summary()).color(p.err));
-        if let Some(details) = &e.details {
-            ui.label(RichText::new(details).small());
-        }
+        ui.label(theme::title(&e.message).color(p.err));
         if let Some(action) = &e.action {
             ui.label(RichText::new(action).small().color(p.muted));
         }
+        // Short details read fine inline; long ones (such as the whole credential provider
+        // chain) stay behind a toggle.
+        if let Some(details) = &e.details {
+            if is_short(details) {
+                ui.label(RichText::new(details).small());
+            } else {
+                let id = ui.scope_id().with(("error_details", &e.message));
+                let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+                theme::disclosure(ui, &mut open, "Details");
+                ui.data_mut(|d| d.insert_temp(id, open));
+                if open {
+                    ui.label(RichText::new(details).small().monospace());
+                }
+            }
+        }
     });
+}
+
+/// One line of at most 120 characters.
+fn is_short(text: &str) -> bool {
+    text.len() <= 120 && !text.contains('\n')
 }
 
 /// Shows the file name and a "Choose…" button. Returns a newly picked path.
@@ -2720,6 +3065,15 @@ mod tests {
                 out.textures_delta.clear();
             }
         }
+    }
+
+    #[test]
+    fn only_short_single_line_details_are_shown_inline() {
+        assert!(is_short("certificate has expired"));
+        assert!(!is_short(
+            "no credentials found in chain. Attempted:\n  Environment: …"
+        ));
+        assert!(!is_short(&"x".repeat(121)));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "aws-iot-mqtt-client"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Cross-platform desktop MQTT 3.1.1/5 client for AWS IoT Core"
@@ -19,12 +19,14 @@ path = "src/main.rs"
 [dependencies]
 # The AWS SDK crates' default "rustls" feature pulls in a legacy HTTPS stack (rustls 0.21, hyper
 # 0.14) with known advisories; "default-https-client" is the current rustls 0.23 client.
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence", "accesskit"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence", "accesskit", "clipboard"] }
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 aws-config = { version = "1.13", features = ["behavior-version-latest"] }
 aws-sdk-iot = { version = "1.135", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-sts = { version = "1.124", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-iotdataplane = { version = "1.121", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+# Distinguishes "no credentials" from other credential failures.
+aws-credential-types = "1"
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
@@ -36,6 +38,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 jiff = "1"
+
+# Embeds the icon in the Windows .exe (build.rs). Only built on Windows.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }

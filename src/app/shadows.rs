@@ -18,7 +18,15 @@ use crate::error::AppError;
 use crate::icons;
 use crate::mqtt::ConnectionState;
 use crate::shadow::{self, Applied, Section, ShadowName, Shadows, Status};
+use crate::shadow_fields::{self as form, Field, FieldValue, Kind};
 use crate::theme::{self, Palette};
+
+/// How the update is edited: typed fields, or raw JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EditMode {
+    Fields,
+    Json,
+}
 
 /// Shadows of the Thing the client is (or was last) connected as.
 pub(super) struct ShadowState {
@@ -27,11 +35,22 @@ pub(super) struct ShadowState {
     pub connection_id: Option<u64>,
     /// The shadow-topic subscription was acknowledged, so `get`s will be answered.
     pub subscribed: bool,
+    /// Packet ID of the pending shadow-topic SUBSCRIBE, to recognize its SUBACK.
+    sub_pkid: Option<u16>,
+    /// Requests timed out and the subscription was renewed; don't renew again until a
+    /// response arrives (avoids retrying forever when the broker never answers).
+    renewed: bool,
+    /// How long to wait for a shadow response ([`shadow::RESPONSE_TIMEOUT`]; shorter in tests).
+    pub timeout: std::time::Duration,
     /// `get`s waiting for the subscription to be acknowledged.
     pending: Vec<ShadowName>,
     pub listing: bool,
     pub selected: Option<ShadowName>,
     pub section: Section,
+    pub mode: EditMode,
+    /// The form editor's fields (`Fields` mode).
+    pub fields: Vec<Field>,
+    /// The JSON editor's text (`Json` mode).
     pub editor: String,
     /// What the editor was last filled from: shadow, section, and document version.
     editor_source: Option<(ShadowName, Section, Option<u64>)>,
@@ -47,10 +66,15 @@ impl Default for ShadowState {
             shadows: None,
             connection_id: None,
             subscribed: false,
+            sub_pkid: None,
+            renewed: false,
+            timeout: shadow::RESPONSE_TIMEOUT,
             pending: Vec::new(),
             listing: false,
             selected: None,
             section: Section::Desired,
+            mode: EditMode::Fields,
+            fields: Vec::new(),
             editor: String::new(),
             editor_source: None,
             editor_dirty: false,
@@ -79,11 +103,12 @@ impl MqttApp {
         };
         let thing = thing.clone();
         let connection_id = conn.id;
-        let subscribe = conn.subscribe(&shadow::subscription_filter(&thing), 1);
+        let subscribe = conn.subscribe(&shadow::subscription_filter(&thing), 1, &[]);
         self.shadow = ShadowState {
             shadows: Some(Shadows::new(thing.clone())),
             connection_id: Some(connection_id),
             selected: Some(ShadowName::Classic),
+            timeout: self.shadow.timeout,
             ..ShadowState::default()
         };
         if let Err(e) = subscribe {
@@ -146,9 +171,50 @@ impl MqttApp {
         }
     }
 
-    /// The first SUBACK after connecting acknowledges the shadow subscription.
-    pub(super) fn shadow_suback(&mut self, details: &str) {
-        if self.shadow.subscribed || self.shadow.shadows.is_none() {
+    /// The shadow-topic filter for the current shadows, if any.
+    pub(super) fn shadow_filter(&self) -> Option<String> {
+        self.shadow
+            .shadows
+            .as_ref()
+            .map(|s| shadow::subscription_filter(&s.thing))
+    }
+
+    /// Tracks the shadow subscription's SUBSCRIBE and SUBACK by packet ID.
+    pub(super) fn shadow_packet(&mut self, entry: &crate::packet_log::PacketLogEntry) {
+        use crate::packet_log::{Direction, Replay};
+        let pkid = packet_id(&entry.details);
+        match (entry.direction, entry.kind.as_str()) {
+            (Direction::Sent, "SUBSCRIBE") => {
+                if let Some(Replay::Subscribe { filter, .. }) = &entry.replay {
+                    if Some(filter) == self.shadow_filter().as_ref() {
+                        self.shadow.sub_pkid = pkid;
+                    }
+                }
+            }
+            (Direction::Received, "SUBACK") if pkid.is_some() && pkid == self.shadow.sub_pkid => {
+                self.shadow.sub_pkid = None;
+                self.shadow_suback(&entry.details);
+            }
+            _ => {}
+        }
+    }
+
+    /// Subscribes to the shadow topics again. `get`s wait until it's acknowledged.
+    fn renew_shadow_subscription(&mut self) {
+        let (Some(filter), Some(conn)) = (self.shadow_filter(), &self.connection) else {
+            return;
+        };
+        self.shadow.subscribed = false;
+        if let Err(e) = conn.subscribe(&filter, 1, &[]) {
+            if let Some(s) = &mut self.shadow.shadows {
+                s.list_error = Some(e.summary());
+            }
+        }
+    }
+
+    /// The SUBACK for the shadow-topic subscription.
+    fn shadow_suback(&mut self, details: &str) {
+        if self.shadow.shadows.is_none() {
             return;
         }
         if !details.contains("Success") {
@@ -181,7 +247,7 @@ impl MqttApp {
         }
         let topic = shadow::request_topic(&shadows.thing, &name, "get");
         if let Some(conn) = &self.connection {
-            if let Err(e) = conn.publish(&topic, 1, false, b"{}".to_vec()) {
+            if let Err(e) = conn.publish(&topic, 1, false, b"{}".to_vec(), &[]) {
                 shadows.get_or_insert(name).status = Status::Error(e.summary());
             }
         }
@@ -194,23 +260,55 @@ impl MqttApp {
         };
         match shadows.apply(topic, payload) {
             Applied::NotShadow => false,
-            Applied::Handled => true,
+            Applied::Handled => {
+                self.shadow.renewed = false;
+                true
+            }
             Applied::Refresh(name) => {
+                self.shadow.renewed = false;
                 self.shadow_get(name);
                 true
             }
         }
     }
 
+    /// Times out unanswered shadow requests. The first time that happens, the shadow
+    /// subscription may be gone (for example, unsubscribed from the Subscriptions list), so
+    /// subscribe again and reload every shadow once.
     pub(super) fn expire_shadow_requests(&mut self) {
-        if let Some(s) = &mut self.shadow.shadows {
-            s.expire(Instant::now(), shadow::RESPONSE_TIMEOUT);
+        let live = self.shadows_live();
+        let Some(s) = &mut self.shadow.shadows else {
+            return;
+        };
+        let expired = s.expire(Instant::now(), self.shadow.timeout);
+        if expired == 0 || self.shadow.renewed || !live {
+            return;
+        }
+        let names: Vec<ShadowName> = s.items.keys().cloned().collect();
+        self.shadow.renewed = true;
+        self.renew_shadow_subscription();
+        for name in names {
+            self.shadow_get(name);
         }
     }
 
     fn shadow_update(&mut self, name: ShadowName) {
         self.shadow.edit_error = None;
-        let payload = match shadow::update_payload(self.shadow.section, &self.shadow.editor) {
+        let text = match self.shadow.mode {
+            EditMode::Json => self.shadow.editor.clone(),
+            EditMode::Fields => match form::to_value(&self.shadow.fields) {
+                Ok(v) if v.as_object().is_some_and(|m| m.is_empty()) => {
+                    self.shadow.edit_error = Some("Add a field to send.".into());
+                    return;
+                }
+                Ok(v) => v.to_string(),
+                Err(errors) => {
+                    self.shadow.edit_error = Some(errors.join("\n"));
+                    return;
+                }
+            },
+        };
+        let payload = match shadow::update_payload(self.shadow.section, &text) {
             Ok(p) => p,
             Err(e) => {
                 self.shadow.edit_error = Some(e);
@@ -222,10 +320,9 @@ impl MqttApp {
         };
         let topic = shadow::request_topic(&shadows.thing, &name, "update");
         let entry = shadows.get_or_insert(name);
-        match conn.publish(&topic, 1, false, payload) {
+        match conn.publish(&topic, 1, false, payload, &[]) {
             Ok(()) => {
-                entry.updating = true;
-                entry.update_error = None;
+                entry.start_update(Instant::now());
                 self.shadow.editor_dirty = false;
             }
             Err(e) => entry.update_error = Some(e.summary()),
@@ -250,29 +347,48 @@ impl MqttApp {
     // UI
     // -----------------------------------------------------------------------------------------
 
-    /// "Shadows", with how many exist once they're known.
-    pub(super) fn shadows_tab_label(&self) -> String {
-        match &self.shadow.shadows {
-            Some(s) if s.existing() > 0 => format!("Shadows {}", s.existing()),
-            _ => "Shadows".into(),
+    /// Switches between the form and JSON, carrying the edits over. Stays put (with an
+    /// explanation) when the current edits can't be converted.
+    fn switch_editor_mode(&mut self, mode: EditMode, shadow_value: Option<&Value>) {
+        let s = &mut self.shadow;
+        match mode {
+            EditMode::Json => match form::to_value(&s.fields) {
+                Ok(v) => {
+                    s.editor = serde_json::to_string_pretty(&v).unwrap_or_default();
+                    s.edit_error = None;
+                    s.mode = mode;
+                }
+                Err(errors) => {
+                    s.edit_error = Some(format!(
+                        "Fix these before switching to JSON:\n{}",
+                        errors.join("\n")
+                    ));
+                }
+            },
+            EditMode::Fields => match serde_json::from_str::<Value>(&s.editor) {
+                Ok(v @ Value::Object(_)) => {
+                    s.fields = form::fields_against(Some(&v), shadow_value);
+                    s.edit_error = None;
+                    s.mode = mode;
+                }
+                Ok(Value::Null) => {
+                    s.fields.clear();
+                    s.edit_error = None;
+                    s.mode = mode;
+                }
+                _ => {
+                    s.edit_error =
+                        Some("To edit as fields, the JSON needs to be a valid object.".into());
+                }
+            },
         }
     }
 
     pub(super) fn shadows_view(&mut self, ui: &mut egui::Ui) {
         if self.shadow.shadows.is_none() {
-            theme::card(ui, |ui| {
-                theme::card_title(ui, "Device shadows", |_| {});
-                let text = match self.settings.mode {
-                    IdentityMode::ClientId => {
-                        "Shadows belong to a Thing. Connect as an IoT Thing on the Client tab to \
-                         see its shadows."
-                    }
-                    IdentityMode::Thing => {
-                        "Connect as a Thing on the Client tab. Its classic and named shadows \
-                         load automatically."
-                    }
-                };
-                theme::hint(ui, text);
+            ui.vertical_centered(|ui| {
+                ui.set_max_width(560.0);
+                theme::card(ui, |ui| self.shadow_connect_pane(ui));
             });
             return;
         }
@@ -292,6 +408,67 @@ impl MqttApp {
         });
     }
 
+    /// A short connect form for someone who just wants to see a Thing's shadows: account,
+    /// Thing, certificate, and Connect. Everything else uses the Client tab's settings.
+    fn shadow_connect_pane(&mut self, ui: &mut egui::Ui) {
+        let gap = theme::metrics(ui).gap;
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            theme::card_title(ui, "Connect to see shadows", |_| {});
+            theme::hint(
+                ui,
+                "Shadows belong to an IoT Thing. Choose the Thing and its certificate, then \
+                 connect. Its classic and named shadows load automatically.",
+            );
+            ui.add_space(gap);
+
+            if self.state.is_active() && self.settings.mode == IdentityMode::ClientId {
+                theme::hint(
+                    ui,
+                    "You're connected with a client ID, which has no shadows. Disconnect on \
+                     the Client tab to connect as a Thing.",
+                );
+                return;
+            }
+            if self.settings.mode == IdentityMode::ClientId {
+                ui.horizontal(|ui| {
+                    theme::hint(ui, "The Client tab is set to connect with a client ID.");
+                    if theme::link_button(ui, "Use an IoT Thing").clicked() {
+                        self.settings.mode = IdentityMode::Thing;
+                    }
+                });
+                return;
+            }
+
+            ui.add_enabled_ui(!self.state.is_active(), |ui| {
+                theme::section_label(ui, "AWS account");
+                self.account_card(ui);
+                ui.add_space(gap);
+                theme::section_label(ui, "Thing");
+                self.things_section(ui);
+                ui.add_space(gap);
+                theme::section_label(ui, "Certificate");
+                egui::Grid::new("shadow_conn_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        // The endpoint fills in when the account loads; only ask when it hasn't.
+                        if self.settings.endpoint.trim().is_empty() {
+                            theme::field_label(ui, "Endpoint");
+                            self.endpoint_picker(ui);
+                            ui.end_row();
+                        }
+                        self.certificate_fields(ui);
+                    });
+            });
+            ui.add_space(gap);
+            self.connect_actions(ui);
+            if self.connection_error.is_some() {
+                ui.add_space(4.0);
+                super::show_error(ui, self.connection_error.as_ref());
+            }
+        });
+    }
+
     fn shadow_list(&mut self, ui: &mut egui::Ui) {
         let p = Palette::of(ui);
         let live = self.shadows_live();
@@ -303,6 +480,15 @@ impl MqttApp {
                 refresh = true;
             }
         });
+        let existing = self.shadow.shadows.as_ref().map_or(0, Shadows::existing);
+        if existing > 0 {
+            theme::count_caption(ui, existing, "active");
+        }
+        if !live && self.state != ConnectionState::Connected {
+            // Reconnect right here, with the same Thing and certificate.
+            self.connect_actions(ui);
+            ui.add_space(4.0);
+        }
         let Some(shadows) = &self.shadow.shadows else {
             return;
         };
@@ -376,6 +562,7 @@ impl MqttApp {
             theme::hint(ui, "Choose a shadow.");
             return;
         };
+        let topic = shadow::request_topic(&shadows.thing, &name, "update");
 
         theme::card_title(ui, &format!("{} shadow", name.label()), |ui| {
             if let Some(ts) = sh
@@ -421,7 +608,20 @@ impl MqttApp {
         }
 
         ui.add_space(10.0);
-        theme::section_label(ui, "Update");
+        let mut mode = self.shadow.mode;
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "Update");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme::segmented_inline(
+                    ui,
+                    &mut mode,
+                    &[(EditMode::Fields, "Fields"), (EditMode::Json, "JSON")],
+                );
+            });
+        });
+        if mode != self.shadow.mode {
+            self.switch_editor_mode(mode, sh.section(self.shadow.section));
+        }
         theme::segmented(
             ui,
             &mut self.shadow.section,
@@ -441,34 +641,68 @@ impl MqttApp {
             || (!self.shadow.editor_dirty && self.shadow.editor_source != Some(source.clone()))
         {
             self.shadow.editor = editor_text(sh.section(self.shadow.section));
+            self.shadow.fields = form::fields_from(sh.section(self.shadow.section));
             self.shadow.editor_dirty = false;
             self.shadow.edit_error = None;
             self.shadow.editor_source = Some(source);
         }
-        theme::inset(ui, |ui| {
-            let edit = ui.add(
-                egui::TextEdit::multiline(&mut self.shadow.editor)
-                    .code_editor()
-                    .frame(egui::Frame::new())
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY),
-            );
-            if edit.changed() {
-                self.shadow.editor_dirty = true;
+        let form_errors = match self.shadow.mode {
+            EditMode::Fields => {
+                let mut changed = false;
+                theme::inset(ui, |ui| {
+                    if self.shadow.fields.is_empty() {
+                        theme::hint(ui, "No fields yet.");
+                    }
+                    field_rows(ui, &mut self.shadow.fields, &mut changed);
+                });
+                if changed {
+                    self.shadow.editor_dirty = true;
+                }
+                theme::hint(
+                    ui,
+                    format!(
+                        "Sends these fields as the {} state to {topic}. Fields you leave out \
+                         keep their current values.",
+                        self.shadow.section.key()
+                    ),
+                );
+                form::to_value(&self.shadow.fields)
+                    .err()
+                    .unwrap_or_default()
             }
-        });
-        theme::hint(
-            ui,
-            format!(
-                "Publishes {{\"state\": {{\"{}\": …}}}} to {}. Use null to clear it.",
-                self.shadow.section.key(),
-                shadow::request_topic(&shadows.thing, &name, "update")
-            ),
-        );
+            EditMode::Json => {
+                theme::inset(ui, |ui| {
+                    let edit = ui.add(
+                        egui::TextEdit::multiline(&mut self.shadow.editor)
+                            .code_editor()
+                            .frame(egui::Frame::new())
+                            .desired_rows(8)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if edit.changed() {
+                        self.shadow.editor_dirty = true;
+                    }
+                });
+                theme::hint(
+                    ui,
+                    format!(
+                        "Publishes {{\"state\": {{\"{}\": …}}}} to {topic}. Use null to clear it.",
+                        self.shadow.section.key()
+                    ),
+                );
+                Vec::new()
+            }
+        };
+        for error in &form_errors {
+            ui.label(RichText::new(error).small().color(p.err));
+        }
         let mut send = false;
         ui.horizontal(|ui| {
             let button = theme::primary_button(ui, "Send update");
-            if ui.add_enabled(live && !sh.updating, button).clicked() {
+            if ui
+                .add_enabled(live && !sh.updating && form_errors.is_empty(), button)
+                .clicked()
+            {
                 send = true;
             }
             if theme::link_button(ui, "Reset").clicked() {
@@ -492,6 +726,135 @@ impl MqttApp {
             self.shadow_update(name);
         }
     }
+}
+
+/// One row per field: name, type, value, and a remove button. Groups nest below their row.
+fn field_rows(ui: &mut egui::Ui, fields: &mut Vec<Field>, changed: &mut bool) {
+    let p = Palette::of(ui);
+    let mut dropped = None;
+    for (index, field) in fields.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            let key_width = 150.0;
+            if field.existing {
+                // An update can't rename a field, so names from the shadow are fixed.
+                ui.add_sized(
+                    [key_width, 20.0],
+                    egui::Label::new(RichText::new(&field.key).monospace()).truncate(),
+                );
+            } else {
+                let key = egui::TextEdit::singleline(&mut field.key)
+                    .id_salt(("field_key", field.id))
+                    .hint_text("name")
+                    .desired_width(key_width);
+                *changed |= ui.add(key).changed();
+            }
+
+            if field.is_removal() {
+                theme::hint(ui, "Removed when you send");
+                if theme::link_button(ui, "Undo").clicked() {
+                    field.undo_remove();
+                    *changed = true;
+                }
+                return;
+            }
+
+            let mut kind = field.value.kind();
+            egui::ComboBox::from_id_salt(("field_kind", field.id))
+                .width(100.0)
+                .selected_text(kind.label())
+                .show_ui(ui, |ui| {
+                    for k in Kind::ALL {
+                        ui.selectable_value(&mut kind, k, k.label());
+                    }
+                });
+            if kind != field.value.kind() {
+                field.value = field.value.convert(kind);
+                *changed = true;
+            }
+
+            let width = (ui.available_width() - 34.0).max(80.0);
+            let id = field.id;
+            *changed |= match &mut field.value {
+                FieldValue::Text(s) => ui
+                    .add(
+                        egui::TextEdit::singleline(s)
+                            .id_salt(("field_value", id))
+                            .hint_text("text")
+                            .desired_width(width),
+                    )
+                    .changed(),
+                FieldValue::Number(s) => {
+                    let valid = form::is_valid_number(s);
+                    let mut edit = egui::TextEdit::singleline(s)
+                        .id_salt(("field_value", id))
+                        .hint_text("0")
+                        .desired_width(width);
+                    if !valid {
+                        edit = edit.text_color(p.err);
+                    }
+                    ui.add(edit).changed()
+                }
+                FieldValue::Bool(b) => {
+                    let before = *b;
+                    ui.radio_value(b, true, "True");
+                    ui.radio_value(b, false, "False");
+                    // Keep the remove button at the row's end, like the other types.
+                    ui.add_space((width - 140.0).max(0.0));
+                    *b != before
+                }
+                FieldValue::List(s) => {
+                    let valid = form::is_valid_list(s);
+                    let mut edit = egui::TextEdit::singleline(s)
+                        .id_salt(("field_value", id))
+                        .code_editor()
+                        .hint_text("[1, 2, 3]")
+                        .desired_width(width);
+                    if !valid {
+                        edit = edit.text_color(p.err);
+                    }
+                    ui.add(edit).changed()
+                }
+                FieldValue::Group(children) => {
+                    let n = children.len();
+                    theme::hint(ui, format!("{n} field{}", if n == 1 { "" } else { "s" }));
+                    false
+                }
+                FieldValue::Null => {
+                    theme::hint(ui, "null");
+                    false
+                }
+            };
+
+            if theme::icon_button(ui, icons::CLOSE, "Remove field", true).clicked() {
+                if !field.remove() {
+                    dropped = Some(index);
+                }
+                *changed = true;
+            }
+        });
+        if let (FieldValue::Group(children), false) = (&mut field.value, field.removed.is_some()) {
+            ui.indent(("field_group", field.id), |ui| {
+                field_rows(ui, children, changed);
+            });
+        }
+    }
+    if let Some(index) = dropped {
+        fields.remove(index);
+    }
+    if theme::link_button(ui, &format!("{} Add field", icons::ADD)).clicked() {
+        fields.push(Field::new_empty());
+        *changed = true;
+    }
+}
+
+/// The packet ID from log details such as `pkid=3 codes=[...]`.
+fn packet_id(details: &str) -> Option<u16> {
+    let digits: String = details
+        .strip_prefix("pkid=")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Read-only, pretty-printed JSON, or "None".

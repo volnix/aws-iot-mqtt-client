@@ -175,6 +175,11 @@ pub async fn open_session(
     log: ApiLogSink,
 ) -> Result<Session, AppError> {
     let profile = profile.filter(|p| !p.is_empty());
+    if let Some(p) = profile {
+        if !list_profiles().iter().any(|known| known == p) {
+            return Err(missing_profile(p));
+        }
+    }
     let mut loader = aws_config::defaults(BehaviorVersion::latest());
     if let Some(p) = profile {
         loader = loader.profile_name(p);
@@ -234,11 +239,7 @@ pub(crate) async fn session_from_config(
                 OP,
                 format!("ERROR ({ms} ms) {details}"),
             ));
-            return Err(AppError::credential("Could not resolve AWS credentials")
-                .with_details(details)
-                .with_action(
-                    "Check the selected profile, or run `aws sso login` / refresh your credentials and retry.",
-                ));
+            return Err(credentials_error(&e, profile).with_details(details));
         }
         Ok(Ok(creds)) => {
             let kind = match creds.expiry() {
@@ -292,6 +293,41 @@ pub(crate) async fn session_from_config(
         }
     }
     Ok(session)
+}
+
+/// A profile that isn't in the shared config or credentials file.
+fn missing_profile(profile: &str) -> AppError {
+    AppError::configuration(format!("AWS profile \"{profile}\" wasn't found")).with_action(format!(
+        "Choose another profile, or create it with `aws configure --profile {profile}`."
+    ))
+}
+
+/// A short, situation-specific message for a credential failure. The full provider chain
+/// goes in the details, which the UI keeps collapsed.
+fn credentials_error(
+    err: &aws_credential_types::provider::error::CredentialsError,
+    profile: Option<&str>,
+) -> AppError {
+    use aws_credential_types::provider::error::CredentialsError as E;
+    let not_found = matches!(err, E::CredentialsNotLoaded(_));
+    match (not_found, profile) {
+        (true, None) => AppError::credential("No AWS credentials found").with_action(
+            "Set them up with `aws configure` or `aws configure sso`, then choose the profile \
+             here. You can also enter an endpoint and client ID by hand.",
+        ),
+        (true, Some(p)) => AppError::credential(format!("Profile \"{p}\" has no credentials"))
+            .with_action(format!(
+                "Check the profile in ~/.aws/config. If it uses SSO, run `aws sso login --profile {p}`."
+            )),
+        (false, Some(p)) => {
+            AppError::credential(format!("Couldn't get credentials for profile \"{p}\""))
+                .with_action(format!(
+                    "If it uses SSO, run `aws sso login --profile {p}` and try again."
+                ))
+        }
+        (false, None) => AppError::credential("Couldn't get AWS credentials")
+            .with_action("Refresh your credentials (for SSO, run `aws sso login`) and try again."),
+    }
 }
 
 /// Shows only the last four characters of an identifier.
@@ -990,6 +1026,43 @@ mod session_tests {
         }
     }
 
+    #[test]
+    fn credential_errors_are_short_and_specific() {
+        use aws_credential_types::provider::error::CredentialsError;
+        let none = || CredentialsError::not_loaded("no providers in chain provided credentials");
+        let err = credentials_error(&none(), None);
+        assert_eq!(err.message, "No AWS credentials found");
+        assert!(err.action.unwrap().contains("aws configure"));
+        let err = credentials_error(&none(), Some("dev"));
+        assert_eq!(err.message, "Profile \"dev\" has no credentials");
+        let failed = || CredentialsError::provider_error("token expired");
+        let err = credentials_error(&failed(), Some("dev"));
+        assert_eq!(err.message, "Couldn't get credentials for profile \"dev\"");
+        assert!(err.action.unwrap().contains("aws sso login --profile dev"));
+        assert_eq!(
+            credentials_error(&failed(), None).message,
+            "Couldn't get AWS credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_profiles_fail_fast_with_a_short_message() {
+        let err = open_session(
+            Some("no-such-profile-9f3a"),
+            Some("us-east-1"),
+            discard_log(),
+        )
+        .await
+        .err()
+        .expect("unknown profile");
+        assert_eq!(err.category, ErrorCategory::Configuration);
+        assert_eq!(
+            err.message,
+            "AWS profile \"no-such-profile-9f3a\" wasn't found"
+        );
+        assert!(err.details.is_none());
+    }
+
     #[tokio::test]
     async fn unresolvable_credentials_are_a_credential_error() {
         let fake = FakeAws::new();
@@ -1000,7 +1073,11 @@ mod session_tests {
             .err()
             .expect("credentials should fail");
         assert_eq!(err.category, ErrorCategory::Credential);
-        assert!(err.action.unwrap().contains("aws sso login"));
+        assert_eq!(err.message, "Profile \"dev\" has no credentials");
+        assert!(
+            err.details.unwrap().contains("no profile"),
+            "the chain stays in the details"
+        );
         assert!(
             log.text().contains("ResolveCredentials ERROR"),
             "{}",
