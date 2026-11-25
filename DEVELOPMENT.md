@@ -140,6 +140,7 @@ pitfalls.
 | Path | Responsibility |
 | --- | --- |
 | `src/app.rs` | egui UI; background work runs on a tokio runtime and reports back over a channel |
+| `src/app/settings_view.rs` | The Settings view: AWS profile, certificate folder, appearance, logging |
 | `src/app/simulator.rs` | The Policy simulator tab |
 | `src/app/shadows.rs` | The Shadows tab: loads the connected Thing's shadows and sends updates |
 | `src/trace_export.rs` | Exports the MQTT log as a JSON or text trace |

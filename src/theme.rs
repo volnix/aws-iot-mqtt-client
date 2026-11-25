@@ -103,7 +103,12 @@ pub struct ThemeColors {
     pub muted: Hex,
     pub accent: Hex,
     pub accent_hover: Hex,
+    /// Text on `accent_fill`.
     pub accent_text: Hex,
+    /// Fill for primary buttons and the selected rail item. Defaults to `accent`; set it when
+    /// `accent` must be dark enough for text but fills should stay bright.
+    #[serde(default)]
+    pub accent_fill: Option<Hex>,
     pub ok: Hex,
     pub warn: Hex,
     pub err: Hex,
@@ -124,6 +129,13 @@ pub struct Metrics {
     pub font_button: f32,
     pub font_small: f32,
     pub font_mono: f32,
+    /// The large title at the top of each view.
+    #[serde(default = "default_font_title")]
+    pub font_title: f32,
+}
+
+fn default_font_title() -> f32 {
+    26.0
 }
 
 /// The whole token file.
@@ -200,6 +212,7 @@ pub struct Palette {
     pub accent: Color32,
     pub accent_hover: Color32,
     pub accent_text: Color32,
+    pub accent_fill: Color32,
     pub ok: Color32,
     pub warn: Color32,
     pub err: Color32,
@@ -220,6 +233,7 @@ impl From<&ThemeColors> for Palette {
             accent: c.accent.0,
             accent_hover: c.accent_hover.0,
             accent_text: c.accent_text.0,
+            accent_fill: c.accent_fill.map_or(c.accent.0, |h| h.0),
             ok: c.ok.0,
             warn: c.warn.0,
             err: c.err.0,
@@ -445,15 +459,48 @@ impl ThemeWatcher {
 // ---------------------------------------------------------------------------------------------
 
 /// Paints the window background: a vertical gradient with soft lights behind the glass.
+/// Default window opacity: a little see-through where the system blurs what's behind the
+/// window (macOS, Windows 11), solid on Linux, where nothing blurs it.
+pub const DEFAULT_WINDOW_OPACITY: f32 = if cfg!(target_os = "linux") { 1.0 } else { 0.8 };
+
+/// What window transparency does on this platform, for the Settings view.
+pub const TRANSPARENCY_HINT: &str = if cfg!(target_os = "macos") {
+    "How much of the desktop shows through, blurred, behind the app."
+} else if cfg!(target_os = "windows") {
+    "How much of the desktop shows through behind the app. Windows 11 blurs it."
+} else {
+    "How much of the desktop shows through behind the app. Needs a compositing window \
+     manager; it isn't blurred."
+};
+
+fn opacity_id() -> egui::Id {
+    egui::Id::unique("window_opacity")
+}
+
+/// Sets how opaque the painted window background is (0.0 to 1.0), for [`paint_background`].
+pub fn set_window_opacity(ctx: &egui::Context, opacity: f32) {
+    ctx.data_mut(|d| d.insert_temp(opacity_id(), opacity.clamp(0.0, 1.0)));
+}
+
+pub fn window_opacity(ctx: &egui::Context) -> f32 {
+    ctx.data(|d| d.get_temp(opacity_id()))
+        .unwrap_or(DEFAULT_WINDOW_OPACITY)
+}
+
 pub fn paint_background(ctx: &egui::Context) {
     let theme = ctx.theme();
     let tokens = tokens(ctx);
     let colors = tokens.colors(theme);
     let rect = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
+    // The window itself is transparent; this sets how much of the desktop shows through.
+    let opacity = window_opacity(ctx);
 
     let mut gradient = Mesh::default();
-    let (top, bottom) = (colors.background_top.0, colors.background_bottom.0);
+    let (top, bottom) = (
+        colors.background_top.0.gamma_multiply(opacity),
+        colors.background_bottom.0.gamma_multiply(opacity),
+    );
     gradient.colored_vertex(rect.left_top(), top);
     gradient.colored_vertex(rect.right_top(), top);
     gradient.colored_vertex(rect.right_bottom(), bottom);
@@ -471,7 +518,7 @@ pub fn paint_background(ctx: &egui::Context) {
         painter.add(Shape::mesh(radial_mesh(
             center,
             orb.radius * scale,
-            orb.color.0,
+            orb.color.0.gamma_multiply(opacity.max(0.35)),
         )));
     }
 }
@@ -530,6 +577,23 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .inner
 }
 
+/// A glass card that extends down to `bottom` (a screen y coordinate), so cards side by side
+/// end level. Content taller than that just makes the card taller.
+pub fn card_to<R>(ui: &mut egui::Ui, bottom: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let m = metrics(ui);
+    // The frame adds its padding and a hairline border around the content.
+    let min = bottom - ui.cursor().top() - 2.0 * f32::from(m.card_padding) - 2.0;
+    glass_frame(ui)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if min > 0.0 {
+                ui.set_min_height(min);
+            }
+            add(ui)
+        })
+        .inner
+}
+
 /// An inset region inside a card: payloads, key/value blocks, step lists.
 pub fn inset<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let p = Palette::of(ui);
@@ -543,6 +607,192 @@ pub fn inset<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
             add(ui)
         })
         .inner
+}
+
+/// The large title at the top of a view.
+pub fn view_title(ui: &mut egui::Ui, text: &str) {
+    let m = metrics(ui);
+    ui.label(
+        RichText::new(text)
+            .size(m.font_title)
+            .family(FontFamily::Name(fonts::SEMIBOLD.into())),
+    );
+}
+
+/// The floating navigation rail's frame: a tall pill of strong glass.
+pub fn rail_frame(ui: &egui::Ui) -> egui::Frame {
+    let p = Palette::of(ui);
+    egui::Frame::new()
+        .fill(p.glass_strong)
+        .stroke(Stroke::new(1.0, p.glass_border))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::symmetric(8, 10))
+        .shadow(Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: p.shadow,
+        })
+}
+
+/// Icons for the navigation rail, drawn as vectors so they're crisp and consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavIcon {
+    /// The MQTT client: a terminal window.
+    Terminal,
+    /// Device shadows: a shape and its shadow.
+    Shadow,
+    /// The policy simulator: a bug, for debugging policies.
+    Bug,
+    /// Logs: lines of a list.
+    Logs,
+    /// Settings: a cog.
+    Cog,
+}
+
+/// Draws `icon` centered at `c`, about 20 points across.
+pub fn paint_nav_icon(painter: &egui::Painter, c: Pos2, icon: NavIcon, color: Color32) {
+    let stroke = Stroke::new(1.6, color);
+    match icon {
+        NavIcon::Terminal => {
+            let frame = Rect::from_center_size(c, Vec2::new(20.0, 16.0));
+            painter.rect_stroke(
+                frame,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            // ">" prompt and "_" cursor.
+            let p = frame.left_top() + Vec2::new(4.5, 5.0);
+            painter.add(Shape::line(
+                vec![p, p + Vec2::new(3.5, 3.0), p + Vec2::new(0.0, 6.0)],
+                stroke,
+            ));
+            painter.line_segment([p + Vec2::new(6.0, 6.0), p + Vec2::new(11.0, 6.0)], stroke);
+        }
+        NavIcon::Shadow => {
+            // The shadow, offset down and right, then the object in front of it.
+            let object = Rect::from_center_size(c - Vec2::splat(2.0), Vec2::splat(13.0));
+            let shadow = object.translate(Vec2::splat(4.5));
+            painter.rect_filled(shadow, CornerRadius::same(3), color.gamma_multiply(0.35));
+            painter.rect_filled(object, CornerRadius::same(3), color.gamma_multiply(0.15));
+            painter.rect_stroke(
+                object,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+        NavIcon::Bug => {
+            let body = Rect::from_center_size(c + Vec2::new(0.0, 2.0), Vec2::new(10.0, 13.0));
+            painter.rect_stroke(
+                body,
+                CornerRadius::same(5),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            painter.line_segment(
+                [
+                    body.center_top() + Vec2::new(0.0, 2.0),
+                    body.center_bottom(),
+                ],
+                stroke,
+            );
+            // Head and antennae.
+            let head = c + Vec2::new(0.0, -6.5);
+            painter.circle_stroke(head, 2.6, stroke);
+            for side in [-1.0_f32, 1.0] {
+                painter.line_segment(
+                    [
+                        head + Vec2::new(side * 1.6, -1.8),
+                        head + Vec2::new(side * 4.0, -4.2),
+                    ],
+                    stroke,
+                );
+                // Three legs a side.
+                for (dy, tilt) in [(-2.5_f32, -2.0_f32), (2.0, 0.0), (6.0, 2.0)] {
+                    let from = Pos2::new(c.x + side * 5.0, c.y + dy);
+                    painter.line_segment([from, from + Vec2::new(side * 4.0, tilt)], stroke);
+                }
+            }
+        }
+        NavIcon::Logs => {
+            for i in 0..3 {
+                let y = c.y - 6.0 + i as f32 * 6.0;
+                painter.circle_filled(Pos2::new(c.x - 7.5, y), 1.4, color);
+                painter.line_segment([Pos2::new(c.x - 3.5, y), Pos2::new(c.x + 8.5, y)], stroke);
+            }
+        }
+        NavIcon::Cog => {
+            // Eight teeth: a polygon alternating between the outer and inner radius.
+            let (outer, inner) = (9.5_f32, 6.8_f32);
+            let teeth = 8;
+            let mut points = Vec::new();
+            for i in 0..teeth {
+                let a = i as f32 / teeth as f32 * std::f32::consts::TAU;
+                let w = std::f32::consts::TAU / teeth as f32;
+                for (da, r) in [(-0.32, inner), (-0.2, outer), (0.2, outer), (0.32, inner)] {
+                    points.push(c + Vec2::angled(a + da * w) * r);
+                }
+            }
+            painter.add(Shape::closed_line(points, stroke));
+            painter.circle_stroke(c, 3.0, stroke);
+        }
+    }
+}
+
+/// One round icon button in the navigation rail. The selected item is filled with the accent.
+pub fn nav_item(ui: &mut egui::Ui, icon: NavIcon, label: &str, selected: bool) -> egui::Response {
+    let p = Palette::of(ui);
+    let size = Vec2::splat(44.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let response = response
+        .on_hover_text(label)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
+    let painter = ui.painter();
+    let center = rect.center();
+    let tile = Rect::from_center_size(center, Vec2::splat(40.0));
+    if selected {
+        painter.rect_filled(tile, CornerRadius::same(9), p.accent_fill);
+    } else if response.hovered() {
+        painter.rect_filled(tile, CornerRadius::same(9), p.inset.gamma_multiply(2.0));
+    }
+    let color = if selected {
+        p.accent_text
+    } else if response.hovered() {
+        p.text
+    } else {
+        p.muted
+    };
+    paint_nav_icon(painter, center, icon, color);
+    response
+}
+
+/// The app's mark (a dot with signal arcs, as in the app icon) in an accent circle.
+pub fn brand_mark(ui: &mut egui::Ui) {
+    let p = Palette::of(ui);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let c = rect.center();
+    painter.rect_filled(
+        Rect::from_center_size(c, Vec2::splat(40.0)),
+        CornerRadius::same(9),
+        p.accent.gamma_multiply(0.18),
+    );
+    let stroke = Stroke::new(2.2, p.accent);
+    painter.circle_filled(c, 3.2, p.accent);
+    for radius in [8.0_f32, 13.5] {
+        for side in [0.0_f32, std::f32::consts::PI] {
+            let points: Vec<Pos2> = (0..=12)
+                .map(|i| {
+                    let a = side - 0.75 + 1.5 * i as f32 / 12.0;
+                    c + Vec2::angled(a) * radius
+                })
+                .collect();
+            painter.add(Shape::line(points, stroke));
+        }
+    }
 }
 
 /// Semibold text in the UI font, for titles.
@@ -589,7 +839,7 @@ pub fn dot(ui: &mut egui::Ui, color: Color32) {
 pub fn pill(ui: &mut egui::Ui, text: impl Into<String>, color: Color32) -> egui::Response {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.14))
-        .corner_radius(CornerRadius::same(9))
+        .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
             ui.label(RichText::new(text.into()).small().color(color))
@@ -601,7 +851,7 @@ pub fn pill(ui: &mut egui::Ui, text: impl Into<String>, color: Color32) -> egui:
 pub fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.14))
-        .corner_radius(CornerRadius::same(11))
+        .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -624,7 +874,7 @@ pub fn primary_button<'a>(ui: &egui::Ui, text: impl Into<String>) -> egui::Butto
     sized(
         ui,
         egui::Button::new(title(text).color(p.accent_text))
-            .fill(p.accent)
+            .fill(p.accent_fill)
             .stroke(Stroke::NONE),
     )
 }
@@ -669,6 +919,46 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, hover: &str, enabled: bool) ->
         .on_hover_text(hover);
     // Screen readers announce the purpose, not the glyph.
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, hover));
+    response
+}
+
+/// The standard "copy" symbol, drawn as vectors: a front sheet, with the visible edges of a
+/// sheet behind it.
+fn paint_copy_symbol(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let s = rect.height().min(rect.width()) * 0.8;
+    let origin = rect.center() - Vec2::splat(s * 0.5);
+    let side = s * 0.7;
+    let offset = s * 0.3;
+    let stroke = Stroke::new(1.2, color);
+    let front = Rect::from_min_size(origin + Vec2::splat(offset), Vec2::splat(side));
+    painter.rect_stroke(
+        front,
+        CornerRadius::same(2),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    // The back sheet shows only above and to the left of the front one.
+    let back = Rect::from_min_size(origin, Vec2::splat(side));
+    let points = vec![
+        Pos2::new(front.left() - 1.5, back.bottom()),
+        back.left_bottom(),
+        back.left_top(),
+        back.right_top(),
+        Pos2::new(back.right(), front.top() - 1.5),
+    ];
+    painter.add(Shape::line(points, stroke));
+}
+
+/// An outlined copy button sized to one line of text, with the vector copy symbol (or a
+/// check mark right after copying).
+pub fn copy_icon_button(ui: &mut egui::Ui, hover: &str, copied: bool) -> egui::Response {
+    if copied {
+        return inline_icon_button(ui, crate::icons::CHECK, hover);
+    }
+    let response = inline_icon_button(ui, " ", hover);
+    let p = Palette::of(ui);
+    let color = if response.hovered() { p.text } else { p.muted };
+    paint_copy_symbol(ui.painter(), response.rect, color);
     response
 }
 
@@ -735,7 +1025,7 @@ pub fn paint_toast(ctx: &egui::Context) {
             egui::Frame::new()
                 .fill(colors.glass_strong.0)
                 .stroke(egui::Stroke::new(1.0, colors.glass_border.0))
-                .corner_radius(CornerRadius::same(10))
+                .corner_radius(CornerRadius::same(7))
                 .inner_margin(Margin::symmetric(12, 6))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 4],
@@ -782,12 +1072,7 @@ pub fn copy_button(
     let now = ui.input(|i| i.time);
     let copied_at: Option<f64> = ui.data(|d| d.get_temp(id));
     let recent = copied_at.is_some_and(|t| now - t < COPIED_FOR);
-    let icon = if recent {
-        crate::icons::CHECK
-    } else {
-        crate::icons::COPY
-    };
-    let response = inline_icon_button(ui, icon, hover);
+    let response = copy_icon_button(ui, hover, recent);
     if response.clicked() {
         copy_to_clipboard(ui.ctx(), text(), what);
         ui.data_mut(|d| d.insert_temp(id, now));
@@ -980,12 +1265,12 @@ pub fn list_row(
     } else {
         text.color(p.muted)
     };
-    ui.put(
-        rect.shrink2(Vec2::new(10.0, 0.0)),
-        egui::Label::new(text)
-            .truncate()
-            .halign(egui::Align::LEFT)
-            .selectable(false),
+    // Left-aligned in the row (`ui.put` would center the label).
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(Vec2::new(12.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| ui.add(egui::Label::new(text).truncate().selectable(false)),
     );
     response
 }
@@ -1161,8 +1446,15 @@ mod tests {
                     assert!(ratio >= 4.5, "{theme:?} {name} {ratio:.2}");
                 }
             }
-            let button = contrast(rgb(c.accent_text.0), rgb(c.accent.0));
+            // Primary buttons draw `accent_text` on `accent_fill` (or `accent` without one).
+            let fill = c.accent_fill.map_or(c.accent.0, |h| h.0);
+            let button = contrast(rgb(c.accent_text.0), rgb(fill));
             assert!(button >= 4.5, "{theme:?} accent button text {button:.2}");
+            // Accent-colored text (links, selected tabs) sits on glass, like other text.
+            for surface in text_surfaces(c) {
+                let ratio = contrast(rgb(c.accent.0), surface);
+                assert!(ratio >= 4.5, "{theme:?} accent text {ratio:.2}");
+            }
         }
     }
 

@@ -76,6 +76,18 @@ python3 scripts/generate_notice.py --check   # only fails if dependencies change
   family must be installed: a bare `egui::Context::default()` panics on it.
 - **Layout:** inside a `ScrollArea` the available height is unbounded. Never size widgets from
   `ui.available_height()` there.
+- **Layout:** `frame()` builds the window from the navigation rail (`nav_rail`), the view
+  header (`view_header`: title, status, Disconnect), the logs drawer, then the view. New views
+  get a `View` variant, a rail item, and a header title.
+- **Logging switches:** the MQTT and API logs only record when `settings.mqtt_logging` /
+  `settings.api_logging` are on. Don't log elsewhere, and keep the Logs button and tabs tied
+  to them (`logging_enabled`).
+- **Transparency:** the window is transparent (`clear_color` is zero). `theme::paint_background`
+  paints it at `settings.window_opacity`; keep panels transparent so it shows through.
+  - On macOS the blur view must sit *behind* eframe's OpenGL view (`macos_blur` in
+    `app.rs` adds it to the frame view). Added to the OpenGL view itself, it covers the
+    whole app and the window looks blank.
+  - Set `AWS_IOT_MQTT_NO_BLUR=1` to launch without the blur when diagnosing drawing problems.
 - **Visibility:** sections show or hide by context (setup vs. connected). Keep advanced options
   behind `theme::disclosure`, and summarize any non-default hidden values next to it.
 

@@ -244,9 +244,12 @@ impl MqttApp {
     pub(super) fn simulator_view(&mut self, ui: &mut egui::Ui) {
         let gap = theme::metrics(ui).gap;
         let result = evaluate(&self.settings.sim, &self.sim_partition());
+        // Both columns' last cards extend to the bottom, so they end level.
+        let bottom = ui.max_rect().bottom();
+        ui.spacing_mut().item_spacing.x = gap;
         ui.columns(2, |columns| {
             // Left: the editor fills the column height.
-            theme::card(&mut columns[0], |ui| self.sim_policy_editor(ui));
+            theme::card_to(&mut columns[0], bottom, |ui| self.sim_policy_editor(ui));
             // Right: request and result scroll together when details are expanded.
             egui::ScrollArea::vertical()
                 .id_salt("sim_right")
@@ -254,7 +257,7 @@ impl MqttApp {
                 .show(&mut columns[1], |ui| {
                     ui.spacing_mut().item_spacing.y = gap;
                     theme::card(ui, |ui| self.sim_request(ui));
-                    theme::card(ui, |ui| self.sim_result(ui, &result));
+                    theme::card_to(ui, bottom, |ui| self.sim_result(ui, &result));
                 });
         });
     }

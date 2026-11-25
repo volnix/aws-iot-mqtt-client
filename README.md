@@ -62,6 +62,14 @@ macOS, Windows, and Linux.
   `mosquitto_sub` command, for macOS/Linux shells or PowerShell. It uses the same endpoint,
   client ID, protocol settings, and certificate files.
 
+**Make it yours**
+
+- A minimal frosted-glass look in light or dark, with adjustable window transparency. The
+  desktop shows through blurred on macOS and Windows 11.
+- Choose where created certificates are saved.
+- Turn the MQTT log, the AWS API log, or both off. Nothing is recorded while a log is off, and
+  with both off the Logs button disappears.
+
 **See everything it does**
 
 - A packet log shows every MQTT packet sent and received. Export it as JSON or text to share a
@@ -93,8 +101,9 @@ To verify a download, compare it with the checksums in `SHA256SUMS` on the relea
 
 ## Getting started
 
-1. **Load your account.** Choose an AWS profile and region, then click **Load from AWS**. For an
-   SSO profile, run `aws sso login --profile <name>` first.
+1. **Load your account.** Choose an AWS profile and region in **Settings** (⚙ in the rail on
+   the left), then click **Load from AWS**. For an SSO profile, run
+   `aws sso login --profile <name>` first.
 2. **Choose who to connect as.** Select a Thing, or switch to **Client ID** and type one.
 3. **Add a certificate.** Choose the device's certificate and private key files, or click
    **Create certificate** to make new ones.
@@ -102,8 +111,9 @@ To verify a download, compare it with the checksums in `SHA256SUMS` on the relea
    takes over. Subscribe to a topic filter at the top, and publish from the composer at the
    bottom.
 
-**Logs** in the top bar opens the packet and API logs. The theme button next to it cycles
-between Auto, Light, and Dark.
+The rail on the left switches between **Client**, **Shadows**, and **Policy simulator**.
+**Logs** opens the packet and API logs, and **Settings** holds the AWS profile, where
+certificates are saved, the theme, window transparency, and which logs are recorded.
 
 ## Permissions
 

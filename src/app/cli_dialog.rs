@@ -122,9 +122,10 @@ impl MqttApp {
                         theme::segmented_inline(
                             ui,
                             &mut dialog.shell,
+                            // Reversed: a right-to-left row lays them out right to left.
                             &[
-                                (Shell::Posix, "macOS / Linux"),
                                 (Shell::PowerShell, "PowerShell"),
+                                (Shell::Posix, "macOS / Linux"),
                             ],
                         );
                         if dialog.shell != before {

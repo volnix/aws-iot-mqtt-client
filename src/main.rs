@@ -18,6 +18,8 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("AWS IoT MQTT Client")
+        // Transparent, so the window-transparency setting can show the (blurred) desktop.
+        .with_transparent(true)
         .with_inner_size([1200.0, 820.0])
         .with_min_inner_size([820.0, 520.0]);
     // Window, taskbar, and (when not run from the .app bundle) Dock icon.

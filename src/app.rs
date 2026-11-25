@@ -34,6 +34,7 @@ use crate::trace_export;
 use crate::validators::{topic_matches, validate_client_id};
 
 mod cli_dialog;
+mod settings_view;
 mod shadows;
 mod simulator;
 use cli_dialog::CliDialog;
@@ -51,6 +52,7 @@ enum View {
     Client,
     Shadows,
     Simulator,
+    Settings,
 }
 
 /// Which theme to use. `System` follows the desktop's light/dark setting.
@@ -63,31 +65,6 @@ enum ThemeChoice {
 }
 
 impl ThemeChoice {
-    fn label(self) -> &'static str {
-        match self {
-            ThemeChoice::System => "Auto",
-            ThemeChoice::Light => "Light",
-            ThemeChoice::Dark => "Dark",
-        }
-    }
-
-    fn icon(self) -> &'static str {
-        match self {
-            ThemeChoice::System => icons::THEME_AUTO,
-            ThemeChoice::Light => icons::THEME_LIGHT,
-            ThemeChoice::Dark => icons::THEME_DARK,
-        }
-    }
-
-    /// The next choice when cycling with the top-bar button.
-    fn next(self) -> Self {
-        match self {
-            ThemeChoice::System => ThemeChoice::Light,
-            ThemeChoice::Light => ThemeChoice::Dark,
-            ThemeChoice::Dark => ThemeChoice::System,
-        }
-    }
-
     fn preference(self) -> egui::ThemePreference {
         match self {
             ThemeChoice::System => egui::ThemePreference::System,
@@ -143,6 +120,14 @@ struct Settings {
     /// Ask GetConnection for client/endpoint IP addresses and ports.
     include_socket_info: bool,
     theme: ThemeChoice,
+    /// Where created certificates are saved. `None` = the app's cache folder.
+    cert_dir: Option<PathBuf>,
+    /// Record MQTT packets in the MQTT log. Off = nothing is recorded, even in memory.
+    mqtt_logging: bool,
+    /// Record AWS API calls in the API log. Off = nothing is recorded, even in memory.
+    api_logging: bool,
+    /// How opaque the window background is, 0.0 (see-through) to 1.0 (solid).
+    window_opacity: f32,
     /// Whether the logs drawer is open.
     logs_open: bool,
     view: View,
@@ -181,6 +166,10 @@ impl Default for Settings {
             subscription_user_properties: Vec::new(),
             include_socket_info: false,
             theme: ThemeChoice::default(),
+            cert_dir: None,
+            mqtt_logging: true,
+            api_logging: true,
+            window_opacity: theme::DEFAULT_WINDOW_OPACITY,
             logs_open: false,
             view: View::Client,
             sim: SimSettings::default(),
@@ -362,8 +351,6 @@ pub struct MqttApp {
     show_conn_details: bool,
     /// Session and last-will options in the setup form.
     show_advanced: bool,
-    /// Profile/region pickers once the account is loaded.
-    account_open: bool,
     /// The less common GetConnection fields.
     show_more_info: bool,
     /// The composer's and subscribe row's User Properties editors.
@@ -376,6 +363,8 @@ pub struct MqttApp {
     shadow: ShadowState,
 
     provision: Option<ProvisionDialog>,
+    /// Where the current view's columns end (screen y), so their last cards end level.
+    column_bottom: f32,
     /// "Copy as mosquitto_pub/sub" dialog.
     cli: Option<CliDialog>,
     notice: Option<String>,
@@ -397,6 +386,7 @@ impl MqttApp {
             .storage
             .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
             .unwrap_or_default();
+        blur_behind_window(cc);
         Self::with_settings(&cc.egui_ctx, rt, settings)
     }
 
@@ -435,7 +425,6 @@ impl MqttApp {
             show_cert_details: false,
             show_conn_details: false,
             show_advanced: false,
-            account_open: false,
             show_more_info: false,
             show_publish_props: false,
             show_subscription_props: false,
@@ -444,6 +433,7 @@ impl MqttApp {
             live: LiveState::default(),
             shadow: ShadowState::default(),
             provision: None,
+            column_bottom: 0.0,
             cli: None,
             notice: None,
             #[cfg(test)]
@@ -677,7 +667,6 @@ impl MqttApp {
                     match result {
                         Ok(s) => {
                             self.aws.session = Some(s);
-                            self.account_open = false;
                         }
                         Err(e) => {
                             self.aws.endpoints_loading = false;
@@ -731,7 +720,8 @@ impl MqttApp {
                 {
                     self.apply_mqtt_event(ctx, event)
                 }
-                AppMsg::Api(entry) => self.api_log.push(entry),
+                // Recorded only while the API log is on.
+                AppMsg::Api(entry) if self.settings.api_logging => self.api_log.push(entry),
                 AppMsg::LiveConnection {
                     connection_id,
                     result,
@@ -819,7 +809,7 @@ impl MqttApp {
             new_name: provision::default_policy_name(identity.name()),
             default_document: document.clone(),
             document,
-            storage_root: provision::default_storage_root(),
+            storage_root: self.certificate_dir(),
             running: false,
             error: None,
             show_document: false,
@@ -897,7 +887,9 @@ impl MqttApp {
                 let changed_subscriptions = entry.direction == Direction::Received
                     && (entry.kind == "SUBACK" || entry.kind == "UNSUBACK");
                 self.shadow_packet(&entry);
-                self.log.push(entry);
+                if self.settings.mqtt_logging {
+                    self.log.push(entry);
+                }
                 if changed_subscriptions {
                     self.fetch_live_subscriptions(ctx, Duration::from_secs(1));
                 }
@@ -1062,59 +1054,103 @@ impl MqttApp {
     // UI: top bar
     // -----------------------------------------------------------------------------------------
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let p = Palette::of(ui);
-        ui.horizontal(|ui| {
-            ui.label(theme::title("AWS IoT MQTT"));
-            ui.add_space(6.0);
-            for (view, label) in [
-                (View::Client, "Client".to_owned()),
-                (View::Shadows, "Shadows".to_owned()),
-                (View::Simulator, "Policy simulator".to_owned()),
-            ] {
-                if theme::tab(ui, self.settings.view == view, label).clicked() {
-                    self.settings.view = view;
+    /// The navigation rail, the full height of the window: the app's mark at the top, the
+    /// views centered, and Logs and Settings at the bottom.
+    fn nav_rail(&mut self, ui: &mut egui::Ui) {
+        use theme::NavIcon;
+        const ITEM: f32 = 44.0;
+        const SPACING: f32 = 6.0;
+        let height = ui.available_height();
+        theme::rail_frame(ui).show(ui, |ui| {
+            ui.set_min_height(height - 20.0);
+            ui.vertical_centered(|ui| {
+                ui.spacing_mut().item_spacing.y = SPACING;
+                theme::brand_mark(ui);
+
+                let bottom = if self.logging_enabled() { 2.0 } else { 1.0 };
+                let views = 3.0;
+                let group = |n: f32| n * ITEM + (n - 1.0) * SPACING;
+                // Center the views in the space between the mark and the bottom group.
+                let free = ui.available_height() - group(bottom) - group(views);
+                ui.add_space((free / 2.0 - SPACING).max(SPACING));
+                for (view, icon, label) in [
+                    (View::Client, NavIcon::Terminal, "Client"),
+                    (View::Shadows, NavIcon::Shadow, "Shadows"),
+                    (View::Simulator, NavIcon::Bug, "Policy simulator"),
+                ] {
+                    if theme::nav_item(ui, icon, label, self.settings.view == view).clicked() {
+                        self.settings.view = view;
+                    }
                 }
-            }
-            ui.add_space(6.0);
-            theme::status_pill(ui, self.state.label(), self.status_color(&p));
-            if let (true, Some((endpoint, client_id))) =
-                (self.state.is_active(), &self.connected_as)
-            {
-                ui.label(
-                    RichText::new(format!("{client_id} · {endpoint}"))
-                        .small()
-                        .color(p.muted),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let next = self.settings.theme.next();
-                if theme::icon_button(
-                    ui,
-                    self.settings.theme.icon(),
-                    &format!(
-                        "Theme: {} (switch to {})",
-                        self.settings.theme.label(),
-                        next.label()
-                    ),
-                    true,
-                )
-                .clicked()
-                {
-                    self.settings.theme = next;
-                    ui.ctx().set_theme(next.preference());
-                }
-                let logs = format!(
-                    "{} Logs {}",
-                    icons::LOGS,
-                    self.log.len() + self.api_log.len()
-                );
-                if theme::tab(ui, self.settings.logs_open, logs)
-                    .on_hover_text("MQTT packets and AWS API calls")
-                    .clicked()
+                let free = ui.available_height() - group(bottom);
+                ui.add_space((free - SPACING).max(SPACING));
+                if self.logging_enabled()
+                    && theme::nav_item(ui, NavIcon::Logs, "Logs", self.settings.logs_open).clicked()
                 {
                     self.settings.logs_open = !self.settings.logs_open;
                 }
+                if theme::nav_item(
+                    ui,
+                    NavIcon::Cog,
+                    "Settings",
+                    self.settings.view == View::Settings,
+                )
+                .clicked()
+                {
+                    self.settings.view = View::Settings;
+                }
+            });
+        });
+    }
+
+    /// The view's large title, with the connection status on the right.
+    fn view_header(&mut self, ui: &mut egui::Ui) {
+        let p = Palette::of(ui);
+        let title = match self.settings.view {
+            View::Client => "Client",
+            View::Shadows => "Shadows",
+            View::Simulator => "Policy simulator",
+            View::Settings => "Settings",
+        };
+        ui.horizontal(|ui| {
+            theme::view_title(ui, title);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // While connected, Disconnect is always one click away, on every view.
+                if matches!(
+                    self.state,
+                    ConnectionState::Connected | ConnectionState::Disconnecting
+                ) {
+                    let disconnecting = self.state == ConnectionState::Disconnecting;
+                    let label = if disconnecting {
+                        "Disconnecting…"
+                    } else {
+                        "Disconnect"
+                    };
+                    if ui
+                        .add_enabled(!disconnecting, theme::danger_button(ui, label))
+                        .clicked()
+                    {
+                        if let Some(connection) = &self.connection {
+                            connection.disconnect();
+                        }
+                    }
+                    if self.settings.view == View::Client
+                        && theme::icon_button(ui, icons::SETTINGS, "Connection details", true)
+                            .clicked()
+                    {
+                        self.show_conn_details = !self.show_conn_details;
+                    }
+                }
+                if let (true, Some((endpoint, client_id))) =
+                    (self.state.is_active(), &self.connected_as)
+                {
+                    ui.label(
+                        RichText::new(format!("{client_id} · {endpoint}"))
+                            .small()
+                            .color(p.muted),
+                    );
+                }
+                theme::status_pill(ui, self.state.label(), self.status_color(&p));
                 if let Some(watcher) = &self.theme_watcher {
                     let color = if watcher.error.is_some() {
                         p.err
@@ -1143,30 +1179,45 @@ impl MqttApp {
     // UI: sidebar
     // -----------------------------------------------------------------------------------------
 
+    /// The sidebar's cards. The last one extends to the bottom, level with the main column.
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let gap = theme::metrics(ui).gap;
         theme::card(ui, |ui| self.account_card(ui));
         ui.add_space(gap);
-        theme::card(ui, |ui| self.identity_card(ui));
         if self.state == ConnectionState::Connected {
+            theme::card(ui, |ui| self.identity_card(ui));
             ui.add_space(gap);
             self.live_panel(ui);
+        } else {
+            let bottom = self.column_bottom;
+            theme::card_to(ui, bottom, |ui| self.identity_card(ui));
         }
     }
 
+    /// The AWS account: who's signed in, or Load. The profile and region are chosen in
+    /// Settings.
     fn account_card(&mut self, ui: &mut egui::Ui) {
         let p = Palette::of(ui);
         let busy = self.aws.busy();
         let mut reload = false;
+        let profile = if self.settings.profile.is_empty() {
+            "Default chain".to_owned()
+        } else {
+            self.settings.profile.clone()
+        };
+        let region = if self.settings.region.is_empty() {
+            "region from profile".to_owned()
+        } else {
+            self.settings.region.clone()
+        };
 
-        // Loaded: a single summary row; the pickers only appear when expanded.
         if let Some(session) = self.aws.session.clone() {
             ui.horizontal(|ui| {
                 let summary = match &session.identity {
                     Some(identity) => format!("Account {}", identity.account),
                     None => "AWS account".to_owned(),
                 };
-                theme::disclosure(ui, &mut self.account_open, &summary).on_hover_text(
+                ui.label(theme::title(summary)).on_hover_text(
                     session
                         .identity
                         .as_ref()
@@ -1188,18 +1239,24 @@ impl MqttApp {
                     theme::pill(ui, &session.region, p.muted);
                 });
             });
-            if self.account_open {
-                ui.add_space(6.0);
-                self.account_pickers(ui);
-            }
+            ui.horizontal(|ui| {
+                theme::hint(ui, format!("Profile: {profile}"));
+                if theme::link_button(ui, "Change").clicked() {
+                    self.settings.view = View::Settings;
+                }
+            });
         } else {
             theme::card_title(ui, "AWS account", |ui| {
                 if busy {
                     ui.spinner();
                 }
             });
-            ui.add_space(6.0);
-            self.account_pickers(ui);
+            ui.horizontal(|ui| {
+                theme::hint(ui, format!("{profile} · {region}"));
+                if theme::link_button(ui, "Change").clicked() {
+                    self.settings.view = View::Settings;
+                }
+            });
             ui.add_space(6.0);
             let width = ui.available_width();
             let button = theme::primary_button(ui, format!("{} Load from AWS", icons::CLOUD))
@@ -1215,40 +1272,6 @@ impl MqttApp {
             ui.add_space(6.0);
             show_error(ui, self.aws.error.as_ref());
         }
-    }
-
-    fn account_pickers(&mut self, ui: &mut egui::Ui) {
-        let width = ui.available_width();
-        theme::field_label(ui, "Profile");
-        let profile_label = if self.settings.profile.is_empty() {
-            "Default chain".to_owned()
-        } else {
-            self.settings.profile.clone()
-        };
-        egui::ComboBox::from_id_salt("profile")
-            .selected_text(profile_label)
-            .width(width)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.settings.profile, String::new(), "Default chain");
-                for profile in &self.profiles {
-                    ui.selectable_value(&mut self.settings.profile, profile.clone(), profile);
-                }
-            });
-        theme::field_label(ui, "Region");
-        let region_label = if self.settings.region.is_empty() {
-            "From profile".to_owned()
-        } else {
-            self.settings.region.clone()
-        };
-        egui::ComboBox::from_id_salt("region")
-            .selected_text(region_label)
-            .width(width)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.settings.region, String::new(), "From profile");
-                for region in aws::IOT_REGIONS {
-                    ui.selectable_value(&mut self.settings.region, (*region).to_owned(), *region);
-                }
-            });
     }
 
     fn identity_card(&mut self, ui: &mut egui::Ui) {
@@ -1506,7 +1529,8 @@ impl MqttApp {
         ui.add_space(gap);
         let mut refresh_subs = false;
         let mut unsubscribe: Option<String> = None;
-        theme::card(ui, |ui| {
+        let bottom = self.column_bottom;
+        theme::card_to(ui, bottom, |ui| {
             theme::card_title(ui, "Subscriptions", |ui| {
                 if self.live.subscriptions_loading {
                     ui.spinner();
@@ -1581,7 +1605,8 @@ impl MqttApp {
     // UI: main column
     // -----------------------------------------------------------------------------------------
 
-    fn main_column(&mut self, ui: &mut egui::Ui) {
+    /// The main column. Its last card extends to `bottom`, level with the sidebar.
+    fn main_column(&mut self, ui: &mut egui::Ui, bottom: f32) {
         let gap = theme::metrics(ui).gap;
         if let Some(error) = self.theme_watcher.as_ref().and_then(|w| w.error.clone()) {
             theme::banner(ui, Severity::Warning, icons::WARNING, false, |ui| {
@@ -1601,61 +1626,41 @@ impl MqttApp {
             ui.add_space(gap);
         }
 
-        theme::card(ui, |ui| {
-            if matches!(
-                self.state,
-                ConnectionState::Connected | ConnectionState::Disconnecting
-            ) {
-                self.connected_bar(ui);
+        let connected = matches!(
+            self.state,
+            ConnectionState::Connected | ConnectionState::Disconnecting
+        );
+        let messages = self.state == ConnectionState::Connected || !self.messages.is_empty();
+        if !connected {
+            if messages {
+                theme::card(ui, |ui| self.connection_setup(ui));
+                ui.add_space(gap);
             } else {
-                self.connection_setup(ui);
+                theme::card_to(ui, bottom, |ui| self.connection_setup(ui));
             }
-        });
+        } else if self.show_conn_details {
+            // Read-only: the settings this connection uses (from the header's details button).
+            theme::card(ui, |ui| {
+                theme::card_title(ui, "Connection details", |ui| {
+                    if theme::icon_button(ui, icons::CLOSE, "Hide connection details", true)
+                        .clicked()
+                    {
+                        self.show_conn_details = false;
+                    }
+                });
+                ui.label(RichText::new(self.connection_summary()).small());
+                ui.add_space(8.0);
+                ui.add_enabled_ui(false, |ui| {
+                    self.connection_essentials(ui);
+                    self.advanced_options(ui, true);
+                });
+            });
+            ui.add_space(gap);
+        }
 
         // Messages only matter once there's a connection (or something left to read).
-        if self.state == ConnectionState::Connected || !self.messages.is_empty() {
-            ui.add_space(gap);
-            theme::card(ui, |ui| self.messages_panel(ui));
-        }
-    }
-
-    /// Compact connection bar shown while connected; settings stay one click away.
-    fn connected_bar(&mut self, ui: &mut egui::Ui) {
-        let p = Palette::of(ui);
-        ui.horizontal(|ui| {
-            theme::dot(ui, self.status_color(&p));
-            ui.label(theme::title("Connected"));
-            ui.label(
-                RichText::new(self.connection_summary())
-                    .small()
-                    .color(p.muted),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let disconnecting = self.state == ConnectionState::Disconnecting;
-                let button = theme::danger_button(
-                    ui,
-                    if disconnecting {
-                        "Disconnecting…"
-                    } else {
-                        "Disconnect"
-                    },
-                );
-                if ui.add_enabled(!disconnecting, button).clicked() {
-                    if let Some(connection) = &self.connection {
-                        connection.disconnect();
-                    }
-                }
-                if theme::icon_button(ui, icons::SETTINGS, "Connection details", true).clicked() {
-                    self.show_conn_details = !self.show_conn_details;
-                }
-            });
-        });
-        if self.show_conn_details {
-            ui.add_space(8.0);
-            ui.add_enabled_ui(false, |ui| {
-                self.connection_essentials(ui);
-                self.advanced_options(ui, true);
-            });
+        if messages {
+            theme::card_to(ui, bottom, |ui| self.messages_panel(ui));
         }
     }
 
@@ -2070,7 +2075,7 @@ impl MqttApp {
             (true, true) => 26.0 + 30.0 * (self.settings.publish_user_properties.len() + 1) as f32,
         };
         let composer_height = if connected { 150.0 + props_height } else { 0.0 };
-        let stream_height = (ui.available_height() - composer_height).max(90.0);
+        let stream_height = (ui.available_height() - composer_height).max(150.0);
         egui::ScrollArea::vertical()
             .id_salt("messages")
             .max_height(stream_height)
@@ -2164,22 +2169,30 @@ impl MqttApp {
     // -----------------------------------------------------------------------------------------
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
+        // Only the logs that are recorded have a tab.
+        match (self.settings.mqtt_logging, self.settings.api_logging) {
+            (false, true) => self.log_tab = LogTab::Api,
+            (true, false) => self.log_tab = LogTab::Mqtt,
+            _ => {}
+        }
         ui.horizontal(|ui| {
-            if theme::tab(
-                ui,
-                self.log_tab == LogTab::Mqtt,
-                format!("MQTT packets {}", self.log.len()),
-            )
-            .clicked()
+            if self.settings.mqtt_logging
+                && theme::tab(
+                    ui,
+                    self.log_tab == LogTab::Mqtt,
+                    format!("MQTT packets {}", self.log.len()),
+                )
+                .clicked()
             {
                 self.log_tab = LogTab::Mqtt;
             }
-            if theme::tab(
-                ui,
-                self.log_tab == LogTab::Api,
-                format!("AWS API calls {}", self.api_log.len()),
-            )
-            .clicked()
+            if self.settings.api_logging
+                && theme::tab(
+                    ui,
+                    self.log_tab == LogTab::Api,
+                    format!("AWS API calls {}", self.api_log.len()),
+                )
+                .clicked()
             {
                 self.log_tab = LogTab::Api;
             }
@@ -2462,9 +2475,81 @@ impl MqttApp {
     }
 }
 
+/// Asks the window system to blur what's behind the (transparent) window: vibrancy on
+/// macOS, Mica on Windows 11. Elsewhere, or if it's unsupported, the window is just
+/// transparent, and the painted background covers it at full opacity. Set
+/// `AWS_IOT_MQTT_NO_BLUR` to turn it off.
+fn blur_behind_window(cc: &eframe::CreationContext<'_>) {
+    if std::env::var_os("AWS_IOT_MQTT_NO_BLUR").is_some() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    macos_blur::apply(cc);
+    #[cfg(target_os = "windows")]
+    {
+        let _ = window_vibrancy::apply_mica(cc, None);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = cc;
+}
+
+#[cfg(target_os = "macos")]
+mod macos_blur {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{
+        AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle,
+    };
+    use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState};
+
+    /// A window handle whose view is the one given (the frame view, here).
+    struct ViewHandle(NonNull<c_void>);
+
+    impl HasWindowHandle for ViewHandle {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            let raw = RawWindowHandle::AppKit(AppKitWindowHandle::new(self.0));
+            // SAFETY: the view outlives this short-lived handle (it belongs to the window).
+            Ok(unsafe { WindowHandle::borrow_raw(raw) })
+        }
+    }
+
+    /// The blur view has to go *behind* the view eframe draws into with OpenGL: AppKit draws
+    /// subviews on top of their parent's OpenGL content, so adding it to that view (what
+    /// `window_vibrancy` does with the window's own handle) would hide the whole app. Its
+    /// parent, the window's frame view, gets the blur instead, beneath every other subview.
+    pub fn apply(cc: &eframe::CreationContext<'_>) {
+        let Ok(handle) = cc.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            return;
+        };
+        let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
+        // SAFETY: `view` is the window's live NSView; `superview` returns its parent or nil.
+        let parent: *mut AnyObject = unsafe { objc2::msg_send![view, superview] };
+        let Some(parent) = NonNull::new(parent.cast::<c_void>()) else {
+            return;
+        };
+        let _ = window_vibrancy::apply_vibrancy(
+            ViewHandle(parent),
+            NSVisualEffectMaterial::UnderWindowBackground,
+            Some(NSVisualEffectState::FollowsWindowActiveState),
+            None,
+        );
+    }
+}
+
 impl eframe::App for MqttApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
+    }
+
+    /// Transparent: the painted background (see `theme::paint_background`) sets how much of
+    /// the desktop shows through.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -2494,6 +2579,7 @@ impl MqttApp {
         }
         self.drain_messages(&ctx);
         self.expire_shadow_requests();
+        theme::set_window_opacity(&ctx, self.settings.window_opacity);
         theme::paint_background(&ctx);
         self.provision_dialog(&ctx);
         self.cli_dialog(&ctx);
@@ -2508,26 +2594,26 @@ impl MqttApp {
             bottom,
         };
 
-        egui::Panel::top("topbar")
+        egui::Panel::left("rail")
             .resizable(false)
             .show_separator_line(false)
-            .frame(egui::Frame::new().inner_margin(edge(g, g, g, 0)))
-            .show(ui, |ui| {
-                theme::glass_frame(ui)
-                    .inner_margin(Margin::symmetric(14, 8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.top_bar(ui);
-                    });
-            });
+            .exact_size(60.0 + gap * 2.0)
+            .frame(egui::Frame::new().inner_margin(edge(g, g, g + 4, g)))
+            .show(ui, |ui| self.nav_rail(ui));
 
-        if self.settings.logs_open {
+        egui::Panel::top("header")
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(edge(4, g, g + 4, 2)))
+            .show(ui, |ui| self.view_header(ui));
+
+        if self.settings.logs_open && self.logging_enabled() {
             egui::Panel::bottom("logs")
                 .resizable(true)
                 .show_separator_line(false)
-                .default_size(250.0)
-                .min_size(130.0)
-                .frame(egui::Frame::new().inner_margin(edge(g, g, 0, g)))
+                .default_size(200.0)
+                .min_size(120.0)
+                .frame(egui::Frame::new().inner_margin(edge(0, g, 0, g)))
                 .show(ui, |ui| {
                     theme::glass_frame(ui).show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -2536,35 +2622,47 @@ impl MqttApp {
                 });
         }
 
-        if self.settings.view == View::Simulator {
-            egui::CentralPanel::no_frame()
-                .frame(egui::Frame::new().inner_margin(Margin::same(g)))
-                .show(ui, |ui| self.simulator_view(ui));
-            return;
+        let content = egui::Frame::new().inner_margin(edge(0, g, g, g));
+        match self.settings.view {
+            View::Simulator => {
+                egui::CentralPanel::no_frame()
+                    .frame(content)
+                    .show(ui, |ui| self.simulator_view(ui));
+            }
+            View::Shadows => {
+                egui::CentralPanel::no_frame()
+                    .frame(content)
+                    .show(ui, |ui| self.shadows_view(ui));
+            }
+            View::Settings => {
+                egui::CentralPanel::no_frame()
+                    .frame(content)
+                    .show(ui, |ui| self.settings_view(ui));
+            }
+            View::Client => {
+                egui::Panel::left("sidebar")
+                    .resizable(true)
+                    .show_separator_line(false)
+                    .default_size(320.0 + gap)
+                    .min_size(280.0 + gap)
+                    // The right margin is the gap between the sidebar and the main column.
+                    .frame(egui::Frame::new().inner_margin(edge(0, g, g, g)))
+                    .show(ui, |ui| {
+                        // Measured outside the scroll area, which has no fixed height.
+                        self.column_bottom = ui.max_rect().bottom();
+                        egui::ScrollArea::vertical()
+                            .id_salt("sidebar_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.sidebar(ui));
+                    });
+                egui::CentralPanel::no_frame()
+                    .frame(content)
+                    .show(ui, |ui| {
+                        let bottom = ui.max_rect().bottom();
+                        self.main_column(ui, bottom);
+                    });
+            }
         }
-        if self.settings.view == View::Shadows {
-            egui::CentralPanel::no_frame()
-                .frame(egui::Frame::new().inner_margin(Margin::same(g)))
-                .show(ui, |ui| self.shadows_view(ui));
-            return;
-        }
-
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .show_separator_line(false)
-            .default_size(320.0)
-            .min_size(280.0)
-            .frame(egui::Frame::new().inner_margin(edge(g, 0, g, g)))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.sidebar(ui));
-            });
-
-        egui::CentralPanel::no_frame()
-            .frame(egui::Frame::new().inner_margin(Margin::same(g)))
-            .show(ui, |ui| self.main_column(ui));
     }
 }
 
@@ -2851,9 +2949,7 @@ fn log_rows(
                                             Replay::Publish { .. } => "Copy as mosquitto_pub",
                                             Replay::Subscribe { .. } => "Copy as mosquitto_sub",
                                         };
-                                        if theme::inline_icon_button(ui, icons::COPY, hover)
-                                            .clicked()
-                                        {
+                                        if theme::copy_icon_button(ui, hover, false).clicked() {
                                             clicked = Some(replay.clone());
                                         }
                                     }
@@ -3055,11 +3151,13 @@ mod tests {
                 app.settings.sim.operation = op;
                 let mut out = ctx.run_ui(Default::default(), |ui| {
                     theme::paint_background(ui.ctx());
-                    app.top_bar(ui);
+                    app.nav_rail(ui);
+                    app.view_header(ui);
+                    app.settings_view(ui);
                     app.shadows_view(ui);
                     app.simulator_view(ui);
                     app.sidebar(ui);
-                    app.main_column(ui);
+                    app.main_column(ui, 800.0);
                     app.log_panel(ui);
                 });
                 out.textures_delta.clear();
@@ -3083,21 +3181,11 @@ mod tests {
     }
 
     #[test]
-    fn theme_choices_cycle_and_map_to_egui_preferences() {
+    fn theme_choices_map_to_egui_preferences() {
         assert_eq!(ThemeChoice::default(), ThemeChoice::System);
-        let mut choice = ThemeChoice::System;
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            seen.push(choice.preference());
-            choice = choice.next();
-        }
         assert_eq!(
-            choice,
-            ThemeChoice::System,
-            "three steps return to the start"
-        );
-        assert_eq!(
-            seen,
+            [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark]
+                .map(ThemeChoice::preference),
             [
                 egui::ThemePreference::System,
                 egui::ThemePreference::Light,

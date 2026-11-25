@@ -225,10 +225,10 @@ fn full_client_workflow() {
     h.run_steps(2);
     assert_eq!(h.state().settings.thing.as_deref(), Some("sensor-1"));
 
-    // Expand the account pickers and collapse them again.
-    click_button(&mut h, &format!("Account {ACCOUNT}"));
-    assert!(h.state().account_open);
-    click_button(&mut h, &format!("Account {ACCOUNT}"));
+    // The profile and region are chosen in Settings.
+    click(&mut h, "Change");
+    assert_eq!(h.state().settings.view, View::Settings);
+    click_button(&mut h, "Client");
 
     // Create a certificate with a new policy.
     click_containing(&mut h, "Create certificate");
@@ -323,7 +323,7 @@ fn full_client_workflow() {
     wait_until(&mut h, "the unsubscribe", |a| a.subscriptions.is_empty());
 
     // Logs drawer: both tabs, ping filter, clear, close.
-    click_containing(&mut h, "Logs ");
+    click_button(&mut h, "Logs");
     assert!(h.state().settings.logs_open);
     click_containing(&mut h, "AWS API calls");
     assert_eq!(h.state().log_tab, LogTab::Api);
@@ -345,10 +345,13 @@ fn full_client_workflow() {
     });
 
     // Cycle the theme back to Auto.
-    for _ in 0..3 {
-        click_containing(&mut h, "Theme: ");
-    }
+    // Theme is set in Settings.
+    click_button(&mut h, "Settings");
+    click(&mut h, "Dark");
+    assert_eq!(h.state().settings.theme, ThemeChoice::Dark);
+    click(&mut h, "Auto");
     assert_eq!(h.state().settings.theme, ThemeChoice::System);
+    click_button(&mut h, "Client");
 
     // Every request the app made was one the fake expected.
     let unrouted: Vec<_> = fake
@@ -943,7 +946,7 @@ fn mosquitto_commands_can_be_copied() {
         "no copy buttons outside the log"
     );
 
-    click_containing(&mut h, "Logs ");
+    click_button(&mut h, "Logs");
     assert_eq!(h.get_all_by_label("Copy as mosquitto_sub").count(), 1);
     assert_eq!(
         h.get_all_by_label("Copy as mosquitto_pub").count(),
@@ -1206,7 +1209,7 @@ fn user_properties_are_sent_shown_and_copied() {
     h.get_by_label("source: ui");
 
     // The copied commands carry each packet's own properties, plus CONNECT's.
-    click_containing(&mut h, "Logs ");
+    click_button(&mut h, "Logs");
     let command = |a: &MqttApp| a.cli_command(a.cli.as_ref().unwrap());
     h.get_by_label("Copy as mosquitto_pub").scroll_to_me();
     h.run_steps(3);
@@ -1222,6 +1225,17 @@ fn user_properties_are_sent_shown_and_copied() {
         "{pubc}"
     );
     click(&mut h, "Close");
+    // The log only builds visible rows; scroll up to the SUBSCRIBE like a user would.
+    for _ in 0..20 {
+        if h.query_by_label("Copy as mosquitto_sub").is_some() {
+            break;
+        }
+        h.get_all_by_label_contains("pkid=")
+            .next()
+            .unwrap()
+            .scroll_up();
+        h.run_steps(1);
+    }
     h.get_by_label("Copy as mosquitto_sub").scroll_to_me();
     h.run_steps(3);
     click_button(&mut h, "Copy as mosquitto_sub");
@@ -1307,7 +1321,7 @@ fn messages_copy_and_the_log_exports_as_a_trace() {
     h.get_by_label("Payload copied to the clipboard");
 
     // Export the log as JSON and as text.
-    click_containing(&mut h, "Logs ");
+    click_button(&mut h, "Logs");
     let json_path = dir.path().join("trace.json");
     h.state_mut().test_export_path = Some(json_path.clone());
     click(&mut h, "Export…");
@@ -1340,4 +1354,92 @@ fn messages_copy_and_the_log_exports_as_a_trace() {
     h.state_mut().test_export_path = Some(json_path.clone());
     click(&mut h, "Export…");
     assert!(!json_path.exists(), "nothing to export after clearing");
+}
+
+/// Settings: the profile, the certificate folder, transparency, and logging. Turning a log off
+/// clears it and hides its tab; turning both off hides the Logs button and drawer.
+#[test]
+fn settings_control_logging_certificates_and_transparency() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let fake = account_fake();
+    let mut h = harness(test_app(rt, &fake, rustls::RootCertStore::empty(), 1));
+    h.run_steps(2);
+    click_button(&mut h, "Settings");
+    assert_eq!(h.state().settings.view, View::Settings);
+    assert_eq!(
+        h.get_all_by_label("Settings").count(),
+        2,
+        "the title and the rail button"
+    );
+
+    // Loading the account from Settings, then the certificate folder used for new ones.
+    click(&mut h, "Load account");
+    wait_until(&mut h, "the account", |a| {
+        a.aws.session.is_some() && !a.aws.busy()
+    });
+    let folder = tempfile::tempdir().unwrap();
+    h.state_mut().settings.cert_dir = Some(folder.path().to_owned());
+    h.run_steps(2);
+    h.get_by_label(&folder.path().display().to_string());
+    click_button(&mut h, "Client");
+    h.get_by_role_and_label(Role::ListBoxOption, "sensor-1")
+        .click();
+    h.run_steps(2);
+    click_containing(&mut h, "Create certificate");
+    wait_until(&mut h, "the dialog", |a| a.provision.is_some());
+    assert_eq!(
+        h.state().provision.as_ref().unwrap().storage_root,
+        folder.path()
+    );
+    click(&mut h, "Cancel");
+    click_button(&mut h, "Settings");
+    click(&mut h, "Use default");
+    assert_eq!(h.state().settings.cert_dir, None);
+
+    // Transparency drives the background's opacity.
+    h.state_mut().settings.window_opacity = 0.4;
+    h.run_steps(2);
+    assert!((theme::window_opacity(&h.ctx) - 0.4).abs() < 1e-6);
+    h.get_by_label_contains("shows through");
+
+    // Logging: the API log has entries from loading the account.
+    assert!(!h.state().api_log.is_empty());
+    click_button(&mut h, "Logs");
+    h.get_by_label_contains("AWS API calls "); // the tab, with its count
+    h.get_by_label("Record AWS API calls").scroll_to_me();
+    h.run_steps(3);
+    click(&mut h, "Record AWS API calls");
+    assert!(!h.state().settings.api_logging);
+    assert!(h.state().api_log.is_empty(), "turning a log off clears it");
+    assert!(
+        h.query_by_label_contains("AWS API calls ").is_none(),
+        "its tab is gone"
+    );
+    h.get_by_label_contains("MQTT packets ");
+    h.get_by_label("Record MQTT packets").scroll_to_me();
+    h.run_steps(3);
+    click(&mut h, "Record MQTT packets");
+    assert!(!h.state().settings.mqtt_logging);
+    h.get_by_label_contains("Both logs are off");
+    assert!(h.query_by_label("Logs").is_none(), "no Logs button");
+    assert!(
+        h.query_by_label_contains("MQTT packets ").is_none(),
+        "no drawer"
+    );
+
+    // Nothing is recorded while off.
+    let before = h.state().aws.generation;
+    h.get_by_label("Reload account").scroll_to_me();
+    h.run_steps(3);
+    click(&mut h, "Reload account");
+    wait_until(&mut h, "the reload", |a| {
+        a.aws.generation > before && !a.aws.busy()
+    });
+    assert!(h.state().api_log.is_empty());
+
+    // Turning one back on brings back the Logs button.
+    h.get_by_label("Record MQTT packets").scroll_to_me();
+    h.run_steps(3);
+    click(&mut h, "Record MQTT packets");
+    h.get_by_label("Logs");
 }

@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-25
+
+A new minimal frosted-glass design in yellow and grey, and a Settings view with privacy
+controls for logging.
+
+### Added
+
+- A **Settings** view (the cog at the bottom of the rail) for the AWS profile and region, the
+  folder for created certificates (the app's cache folder by default), the theme, window
+  transparency, and logging.
+- Logging switches for MQTT packets and AWS API calls. Turning one off clears it and records
+  nothing while it's off. With both off, the Logs button and drawer are hidden.
+- Window transparency. On macOS and Windows 11, the desktop shows through blurred.
+
+### Changed
+
+- A minimal frosted-glass design:
+  - A full-height navigation rail replaces the top tabs. The views are centered, with Logs and
+    Settings at the bottom. Its icons are drawn: a terminal (Client), a shape and its shadow
+    (Shadows), a bug (Policy simulator), a list (Logs), and a cog (Settings).
+  - Each view has a large title, with the connection status and **Disconnect** at the top
+    right. The separate "Connected" card is gone.
+  - Cards are lighter, with gently rounded corners and consistent spacing between them.
+    Cards side by side end level at the bottom.
+- A yellow and grey color scheme replaces the green and blue.
+- The account card shows the profile and region, with a link to change them in Settings.
+- The copy button uses a drawn copy symbol.
+
+### Fixed
+
+- Thing names and shadow field names were centered instead of left-aligned.
+- The Messages list could be squeezed to a sliver when the logs were open.
+- The **Fields | JSON** switch and the mosquitto dialog's shell switch were listed in reverse.
+
 ## [1.2.0] - 2026-11-24
 
 MQTT 5 User Properties, a form editor for shadows, command-line export, shareable traces, an

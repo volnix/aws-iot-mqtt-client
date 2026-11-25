@@ -393,17 +393,21 @@ impl MqttApp {
             return;
         }
         let gap = theme::metrics(ui).gap;
+        // Both cards extend to the bottom, so they end level.
+        let bottom = ui.max_rect().bottom();
         ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
             ui.vertical(|ui| {
                 ui.set_width(280.0);
-                theme::card(ui, |ui| self.shadow_list(ui));
+                theme::card_to(ui, bottom, |ui| self.shadow_list(ui));
             });
-            ui.add_space(gap);
             ui.vertical(|ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("shadow_details")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| theme::card(ui, |ui| self.shadow_details(ui)));
+                    .show(ui, |ui| {
+                        theme::card_to(ui, bottom, |ui| self.shadow_details(ui))
+                    });
             });
         });
     }
@@ -612,10 +616,11 @@ impl MqttApp {
         ui.horizontal(|ui| {
             theme::section_label(ui, "Update");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Listed in reverse: a right-to-left row lays them out right to left.
                 theme::segmented_inline(
                     ui,
                     &mut mode,
-                    &[(EditMode::Fields, "Fields"), (EditMode::Json, "JSON")],
+                    &[(EditMode::Json, "JSON"), (EditMode::Fields, "Fields")],
                 );
             });
         });
@@ -737,9 +742,13 @@ fn field_rows(ui: &mut egui::Ui, fields: &mut Vec<Field>, changed: &mut bool) {
             let key_width = 150.0;
             if field.existing {
                 // An update can't rename a field, so names from the shadow are fixed.
-                ui.add_sized(
-                    [key_width, 20.0],
-                    egui::Label::new(RichText::new(&field.key).monospace()).truncate(),
+                ui.allocate_ui_with_layout(
+                    egui::vec2(key_width, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(key_width);
+                        ui.add(egui::Label::new(RichText::new(&field.key).monospace()).truncate());
+                    },
                 );
             } else {
                 let key = egui::TextEdit::singleline(&mut field.key)
