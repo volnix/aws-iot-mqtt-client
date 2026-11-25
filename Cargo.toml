@@ -39,14 +39,15 @@ serde_json = "1"
 thiserror = "2"
 jiff = "1"
 
+# Blurs what's behind the transparent window (macOS vibrancy, Windows 11 Mica).
+window-vibrancy = "0.8"
+raw-window-handle = "0.6"
+
 # macOS: finds the window's frame view, so the blur goes behind the app (see app.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 
 # Embeds the icon in the Windows .exe (build.rs). Only built on Windows.
-# Blurs what's behind the transparent window (macOS vibrancy, Windows 11 Mica).
-window-vibrancy = "0.8"
-raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
